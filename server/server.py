@@ -43,7 +43,7 @@ from av import VideoFrame
 from zeroconf import ServiceInfo, Zeroconf
 
 # Display virtual Xvfb (abordagem SpaceDesk para o modo Estender)
-from virtual_display import XvfbVirtualDisplay, is_xvfb_available, stop_active_display
+from virtual_display import XvfbVirtualDisplay, is_xvfb_available, stop_active_display, set_active_display
 
 
 # ==========================================================================
@@ -238,6 +238,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
             if success:
                 self._virtual_display = vd
                 self._virtual_display_info = info
+                set_active_display(vd)
                 log.info("Display virtual criado em %s (%s).", result, info.get("resolution", "?"))
                 return "extend", -1, None, None
             else:
@@ -403,6 +404,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
             self._virtual_display.stop()
             self._virtual_display = None
             self._virtual_display_info = None
+            set_active_display(None)
         self._executor.shutdown(wait=False)
 
 

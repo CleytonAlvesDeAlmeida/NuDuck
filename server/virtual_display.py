@@ -5,18 +5,17 @@ Funciona igual ao SpaceDesk: cria um servidor X separado (Xvfb) que o
 celular renderiza e controla, funcionando como uma segunda tela virtual.
 
 Requisitos:
-  sudo apt install xvfb xdotool openbox xsetroot x11-utils
+  sudo apt install xvfb xdotool openbox xsetroot x11-utils xterm
 """
 
-import io
 import logging
-import multiprocessing as mp
 import numpy as np
 import os
 import shutil
 import signal
 import struct
 import subprocess
+import threading
 import time
 
 log = logging.getLogger("NuDuck")
@@ -28,6 +27,12 @@ _active_display = None
 def get_active_display():
     """Retorna o Xvfb ativo, ou None."""
     return _active_display
+
+
+def set_active_display(vd):
+    """Define o Xvfb ativo (usado pelo server.py)."""
+    global _active_display
+    _active_display = vd
 
 
 def stop_active_display():
@@ -49,10 +54,12 @@ class XvfbVirtualDisplay:
         self.display_name = None
         self.xvfb_process = None
         self.wm_process = None
-        self._capture_worker = None
-        self._shared_array = None
-        self._new_frame_event = None
+        # Captura via thread (evita leak de memória compartilhada do multiprocessing)
+        self._capture_thread = None
         self._stop_event = None
+        self._new_frame_event = None
+        self._frame_lock = None
+        self._latest_frame = None
         self._shape = (height, width, 3)
         self._started = False
         self._wm_name = None
@@ -66,7 +73,7 @@ class XvfbVirtualDisplay:
           Falha:   (False, mensagem_de_erro, None)
         """
         if not shutil.which("Xvfb"):
-            return False, "Xvfb não encontrado. Instale: sudo apt install xvfb xdotool openbox", None
+            return False, "Xvfb não encontrado. Instale: sudo apt install xvfb xdotool openbox xterm", None
 
         # Mata qualquer Xvfb órfão antes de tentar
         self._cleanup_orphan_xvfb()
@@ -75,10 +82,7 @@ class XvfbVirtualDisplay:
         for d in range(1, 100):
             lock_file = f"/tmp/.X{d}-lock"
             socket_file = f"/tmp/.X11-unix/X{d}"
-
-            # Tenta remover resquício de Xvfb morto
             self._remove_stale_files(lock_file, socket_file)
-
             if not os.path.exists(socket_file):
                 self.display_num = d
                 break
@@ -97,7 +101,6 @@ class XvfbVirtualDisplay:
                     "-ac", "-nolisten", "tcp",
                     "+extension", "RANDR",
                     "+extension", "RENDER",
-                    "+extension", "Composite",
                     "+extension", "XFIXES",
                     "+extension", "MIT-SHM",
                     "+extension", "BIG-REQUESTS",
@@ -143,14 +146,14 @@ class XvfbVirtualDisplay:
         if not self._wm_name:
             log.warning("Nenhum WM encontrado. Instale openbox.")
 
-        # Abre um terminal automaticamente
+        # Abre um terminal automaticamente no display virtual
         self._open_initial_terminal(env)
 
-        # Inicia captura
-        self._start_capture_worker()
+        # Inicia captura (thread, não processo — sem leak de memória compartilhada)
+        self._start_capture_thread()
 
         # Espera um pouco e verifica se a captura está funcionando
-        time.sleep(1.0)
+        time.sleep(1.5)
         if self._new_frame_event and self._new_frame_event.is_set():
             self._capture_ok = True
             log.info("Captura do Xvfb funcionando.")
@@ -164,6 +167,7 @@ class XvfbVirtualDisplay:
             "display": self.display_name,
             "resolution": f"{self.width}x{self.height}",
             "wm": self._wm_name or "(nenhum)",
+            "capture": "ok" if self._capture_ok else "fallback",
             "note": (
                 f"Display virtual ativo em {self.display_name}. "
                 f"Para abrir apps: DISPLAY={self.display_name} nome_do_app"
@@ -175,12 +179,10 @@ class XvfbVirtualDisplay:
         """Remove arquivos de lock/socket de Xvfb que morreu."""
         try:
             if os.path.exists(lock_file):
-                # Lê o PID do lock file — se o processo não existe, remove
                 try:
                     with open(lock_file) as f:
                         pid_str = f.read().strip().split()[0]
                         pid = int(pid_str)
-                        # Verifica se o processo realmente existe
                         os.kill(pid, 0)
                 except (ProcessLookupError, ValueError, PermissionError):
                     os.remove(lock_file)
@@ -210,14 +212,19 @@ class XvfbVirtualDisplay:
             pass
 
     def _open_initial_terminal(self, env):
-        """Abre um terminal no display virtual."""
-        terminals = ("xterm", "uxterm", "lxterminal", "gnome-terminal", "konsole")
+        """Abre um terminal no display virtual.
+
+        Prefer xterm — funciona com Xvfb e não usa D-Bus.
+        gnome-terminal ignora DISPLAY e abre no monitor físico.
+        """
+        terminals = ("xterm", "uxterm", "lxterminal", "konsole", "gnome-terminal")
         for term in terminals:
             if shutil.which(term):
                 try:
                     args = [term]
                     if term == "gnome-terminal":
-                        args = [term, "--"]
+                        # gnome-terminal usa D-Bus — forçar display via --display
+                        args = ["gnome-terminal", "--display=" + self.display_name, "--"]
                     subprocess.Popen(
                         args + ["/bin/bash"],
                         env=env,
@@ -230,23 +237,93 @@ class XvfbVirtualDisplay:
                     continue
         log.warning("Nenhum terminal encontrado.")
 
+    def _start_capture_thread(self):
+        """Inicia thread que captura o framebuffer do Xvfb."""
+        self._stop_event = threading.Event()
+        self._new_frame_event = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest_frame = np.zeros(self._shape, dtype=np.uint8)
+
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            daemon=True,
+        )
+        self._capture_thread.start()
+
+    def _capture_loop(self):
+        """Loop de captura — roda em thread, usa subprocess (sem conflito X11).
+
+        Tenta xwd primeiro. Se falhar, gera frame colorido (nunca preto).
+        """
+        display_name = self.display_name
+        capture_fn = None
+
+        # --- Método 1: xwd (X Window Dump) — subprocesso, sem conflito X11 ---
+        if shutil.which("xwd"):
+            log.info("Captura via xwd ativa em %s", display_name)
+
+            def capture_xwd():
+                try:
+                    proc = subprocess.Popen(
+                        ["xwd", "-root", "-display", display_name],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        env={**os.environ, "DISPLAY": display_name},
+                    )
+                    xwd_data = proc.stdout.read()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+
+                    if len(xwd_data) > 100:
+                        img_bgr = _xwd_to_bgr(xwd_data, self.width, self.height)
+                        if img_bgr is not None:
+                            with self._frame_lock:
+                                np.copyto(self._latest_frame, img_bgr)
+                            self._new_frame_event.set()
+                            return
+                except Exception:
+                    pass
+                # Se xwd falhou neste frame, não faz nada (mantém frame anterior)
+
+            capture_fn = capture_xwd
+        else:
+            log.warning("xwd não encontrado. Instale: sudo apt install x11-utils")
+
+        # --- Método 2: frame colorido de fallback (nunca preto) ---
+        if capture_fn is None:
+            log.warning("Nenhum método de captura disponível, usando frame colorido")
+            bg = np.full((self.height, self.width, 3), [46, 26, 26], dtype=np.uint8)  # azul escuro BGR
+
+            def capture_fallback():
+                with self._frame_lock:
+                    np.copyto(self._latest_frame, bg)
+                self._new_frame_event.set()
+
+            capture_fn = capture_fallback
+
+        # Loop principal — captura a ~30fps
+        while not self._stop_event.is_set():
+            try:
+                capture_fn()
+            except Exception:
+                pass
+            self._stop_event.wait(0.033)
+
     def stop(self):
         """Para o Xvfb, WM, captura e limpa os arquivos de socket."""
         log.info("Encerrando display virtual %s...", self.display_name)
 
-        # Sinaliza parada do worker
+        # Sinaliza parada da thread de captura
         if self._stop_event:
             self._stop_event.set()
 
-        # Mata o processo de captura
-        if self._capture_worker:
-            self._capture_worker.join(timeout=2)
-            if self._capture_worker.is_alive():
-                self._capture_worker.kill()
-                self._capture_worker.join(timeout=1)
-            self._capture_worker = None
+        # Espera thread terminar
+        if self._capture_thread and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=3)
+        self._capture_thread = None
 
-        # Mata WM e Xvfb
+        # Mata WM
         if self.wm_process:
             try:
                 self.wm_process.terminate()
@@ -255,6 +332,7 @@ class XvfbVirtualDisplay:
                 pass
             self.wm_process = None
 
+        # Mata Xvfb
         if self.xvfb_process:
             try:
                 self.xvfb_process.terminate()
@@ -279,10 +357,11 @@ class XvfbVirtualDisplay:
                 except Exception:
                     pass
 
-        # Limpa recursos de memória compartilhada
-        self._shared_array = None
-        self._new_frame_event = None
+        # Limpa referências (threading não tem leak como multiprocessing)
+        self._latest_frame = None
         self._stop_event = None
+        self._new_frame_event = None
+        self._frame_lock = None
 
         self._started = False
         self._capture_ok = False
@@ -296,46 +375,22 @@ class XvfbVirtualDisplay:
             return False
         return True
 
-    def _start_capture_worker(self):
-        """Inicia processo filho que captura o framebuffer do Xvfb."""
-        self._stop_event = mp.Event()
-        self._new_frame_event = mp.Event()
-        self._shared_array = mp.Array("B", self.height * self.width * 3)
-
-        self._capture_worker = mp.Process(
-            target=_capture_worker,
-            args=(
-                self.display_name,
-                self._shared_array,
-                self._shape,
-                self._new_frame_event,
-                self._stop_event,
-                self.width,
-                self.height,
-            ),
-            daemon=True,
-        )
-        self._capture_worker.start()
-
     def get_frame(self):
         """Retorna o último frame BGR (H, W, 3), ou gera um frame colorido."""
-        if not self._started or not self._shared_array:
+        if not self._started or self._latest_frame is None:
             # Sem display — gera frame azul escuro
             return np.full(self._shape, [46, 26, 26], dtype=np.uint8)
 
-        # Tenta pegar frame do worker
-        if self._new_frame_event and self._new_frame_event.wait(timeout=0.1):
+        # Tenta pegar frame da thread de captura
+        if self._new_frame_event.wait(timeout=0.1):
             self._new_frame_event.clear()
             try:
-                return (
-                    np.frombuffer(self._shared_array.get_obj(), dtype=np.uint8)
-                    .reshape(self._shape)
-                    .copy()
-                )
+                with self._frame_lock:
+                    return self._latest_frame.copy()
             except Exception:
                 pass
 
-        # Worker não produziu frame — gera frame colorido de fallback
+        # Thread não produziu frame — gera frame colorido de fallback
         return np.full(self._shape, [46, 26, 26], dtype=np.uint8)
 
     # ------------------------------------------------------------------
@@ -381,117 +436,75 @@ class XvfbVirtualDisplay:
 
 
 # ----------------------------------------------------------------------
-# Processo de captura
+# Conversão XWD -> numpy BGR
 # ----------------------------------------------------------------------
 
-def _capture_worker(display_name, shared_array, shape, new_frame_event, stop_event, width, height):
-    """Processo filho que captura o framebuffer do Xvfb.
+def _xwd_to_bgr(data, expected_w, expected_h):
+    """Converte dados XWD para numpy array BGR.
 
-    Tenta mss primeiro. Se falhar, usa xwd. Se os dois falharem,
-    gera um frame colorido (nunca preto).
+    Layout do header XWD (todos os campos são CARD32 big-endian):
+      Offset  0: header_size
+      Offset 12: pixmap_width
+      Offset 16: pixmap_height
+      Offset 40: depth (bits por pixel significativos: 24 ou 32)
+      Offset 44: bytes_per_line (bytes por linha, pode ter padding)
+      Offset 48: visual_class
+      Offset 52: red_mask
+      Offset 56: green_mask
+      Offset 60: blue_mask
+    Os dados do pixel começam em data[header_size:].
     """
-    os.environ["DISPLAY"] = display_name
-    os.environ["HOME"] = os.path.expanduser("~")
-
-    capture_fn = None
-
-    # --- Método 1: mss ---
-    try:
-        import mss
-
-        sct = mss.mss()
-        monitors = sct.monitors
-        if len(monitors) >= 2:
-            mon = monitors[1]
-            log.info("Capture (mss) ativo em %s: %dx%d", display_name, mon["width"], mon["height"])
-
-            def capture_mss():
-                try:
-                    raw = sct.grab(mon)
-                    img = np.array(raw)[:, :, :3]
-                    buf = np.frombuffer(shared_array.get_obj(), dtype=np.uint8).reshape(shape)
-                    np.copyto(buf, img)
-                    new_frame_event.set()
-                except Exception:
-                    pass  # não mata o worker, tenta de novo no próximo ciclo
-
-            capture_fn = capture_mss
-        else:
-            log.warning("mss não encontrou monitores em %s, tentando xwd", display_name)
-    except Exception as exc:
-        log.warning("mss falhou em %s (%s), tentando xwd", display_name, exc)
-
-    # --- Método 2: xwd (X Window Dump) ---
-    if capture_fn is None and shutil.which("xwd"):
-        log.info("Capture (xwd) ativo em %s", display_name)
-
-        def capture_xwd():
-            try:
-                proc = subprocess.Popen(
-                    ["xwd", "-root", "-display", display_name],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    env={**os.environ, "DISPLAY": display_name},
-                )
-                xwd_data = proc.stdout.read()
-
-                if len(xwd_data) > 100:
-                    img_rgb = _xwd_to_rgb(xwd_data, width, height)
-                    if img_rgb is not None:
-                        img_bgr = img_rgb[:, :, ::-1].copy()
-                        buf = np.frombuffer(shared_array.get_obj(), dtype=np.uint8).reshape(shape)
-                        np.copyto(buf, img_bgr)
-                        new_frame_event.set()
-            except Exception:
-                pass
-
-        capture_fn = capture_xwd
-
-    # --- Método 3: frame colorido ---
-    if capture_fn is None:
-        log.warning("mss e xwd falharam, usando frame colorido")
-        bg = np.full((height, width, 3), [46, 26, 26], dtype=np.uint8)  # azul escuro BGR
-
-        def capture_fallback():
-            buf = np.frombuffer(shared_array.get_obj(), dtype=np.uint8).reshape(shape)
-            np.copyto(buf, bg)
-            new_frame_event.set()
-
-        capture_fn = capture_fallback
-
-    # Loop principal — nunca morre, tenta de novo a cada frame
-    while not stop_event.is_set():
-        try:
-            capture_fn()
-            stop_event.wait(0.033)  # ~30fps
-        except Exception:
-            stop_event.wait(0.1)
-
-
-def _xwd_to_rgb(data, expected_w, expected_h):
-    """Converte dados XWD para numpy RGB."""
     try:
         if len(data) < 100:
             return None
 
-        header_size = struct.unpack(">I", data[52:56])[0]
-        bpp = struct.unpack(">I", data[48:52])[0]
+        # Lê campos do header XWD (big-endian)
+        header_size = struct.unpack(">I", data[0:4])[0]
+        width = struct.unpack(">I", data[12:16])[0]
+        height = struct.unpack(">I", data[16:20])[0]
+        depth = struct.unpack(">I", data[40:44])[0]
+        bytes_per_line = struct.unpack(">I", data[44:48])[0]
+        red_mask = struct.unpack(">I", data[52:56])[0]
+        blue_mask = struct.unpack(">I", data[60:64])[0]
 
-        if bpp not in (24, 32):
+        if depth not in (24, 32):
+            log.debug("XWD: profundidade %d não suportada (precisa 24 ou 32)", depth)
             return None
 
         pixel_data = data[header_size:]
-        bytes_per_pixel = bpp // 8
-        row_size = expected_w * bytes_per_pixel
 
-        if len(pixel_data) < row_size * expected_h:
+        # Verifica se tem dados suficientes
+        needed = bytes_per_line * height
+        if len(pixel_data) < needed:
+            log.debug("XWD: dados insuficientes (tem %d, precisa %d)", len(pixel_data), needed)
             return None
 
-        img = np.frombuffer(pixel_data[:row_size * expected_h], dtype=np.uint8)
-        img = img.reshape((expected_h, expected_w, bytes_per_pixel))
+        # Calcula bytes por pixel a partir de bytes_per_line e width
+        actual_bpp = bytes_per_line // width if width > 0 else depth // 8
+
+        # Extrai pixels: reshape linha por linha, depois pega só os canais BGR
+        raw = np.frombuffer(pixel_data[:needed], dtype=np.uint8)
+        raw = raw.reshape((height, bytes_per_line))
+
+        # Pega a largura correta e só 3 canais (BGR)
+        valid_w = min(width, expected_w)
+        img = raw[:, :valid_w * actual_bpp].reshape((height, valid_w, actual_bpp))
+        img = img[:, :, :3].copy()
+
+        # Corta para a altura esperada
+        img = img[:min(height, expected_h)]
+
+        # XWD é bottom-up — inverte verticalmente
         img = np.flipud(img)
-        bgr = img[:, :, :3]
-        return bgr[:, :, ::-1].copy()
-    except Exception:
+
+        # Detecta ordem das cores pelos masks
+        # Se red_mask < blue_mask → dados estão em ordem RGB, inverter para BGR
+        if red_mask > 0 and blue_mask > 0 and red_mask < blue_mask:
+            img = img[:, :, ::-1].copy()
+
+        return img
+    except Exception as exc:
+        log.debug("XWD parse falhou: %s", exc)
         return None
 
 
@@ -502,8 +515,6 @@ def is_xvfb_available():
     for d in range(1, 100):
         socket_file = f"/tmp/.X11-unix/X{d}"
         lock_file = f"/tmp/.X{d}-lock"
-
-        # Limpa resquício
         try:
             if os.path.exists(lock_file):
                 with open(lock_file) as f:
