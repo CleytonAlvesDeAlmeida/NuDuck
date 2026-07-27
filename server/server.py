@@ -43,7 +43,7 @@ from av import VideoFrame
 from zeroconf import ServiceInfo, Zeroconf
 
 # Display virtual Xvfb (abordagem SpaceDesk para o modo Estender)
-from virtual_display import XvfbVirtualDisplay, is_xvfb_available
+from virtual_display import XvfbVirtualDisplay, is_xvfb_available, stop_active_display
 
 
 # ==========================================================================
@@ -228,6 +228,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
             return "mirror", 1, None, None
 
         # --- Modo Estender: cria display virtual via Xvfb (SpaceDesk) ---
+        # Limpa Xvfb de conexão anterior (se existir)
+        stop_active_display()
+
         if is_xvfb_available():
             log.info("Criando display virtual via Xvfb...")
             vd = XvfbVirtualDisplay(width=1280, height=800)
@@ -339,9 +342,13 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 out = np.ascontiguousarray(np.array(pil_img)[:, :, ::-1])
                 return VideoFrame.from_ndarray(out, format="bgr24")
 
-            # Sem frame disponível — tela preta
-            black = np.zeros((self._target_h, max(2, int(self._target_h * 16 / 9)), 3), dtype=np.uint8)
-            return VideoFrame.from_ndarray(black, format="bgr24")
+            # get_frame() retornou None (não deveria acontecer mais)
+            log.warning("get_frame() retornou None, gerando frame de fallback")
+            fallback = np.full(
+                (self._target_h, max(2, int(self._target_h * 16 / 9)), 3),
+                [46, 26, 26], dtype=np.uint8,
+            )
+            return VideoFrame.from_ndarray(fallback, format="bgr24")
 
         # --- Caminho normal: captura com mss (modo Espelhar) ---
         if self._sct is None:
@@ -395,6 +402,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         if self._virtual_display:
             self._virtual_display.stop()
             self._virtual_display = None
+            self._virtual_display_info = None
         self._executor.shutdown(wait=False)
 
 
