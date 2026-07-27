@@ -1,0 +1,23 @@
+workflows:
+  android-native-release:
+    name: Build Android APK Nativo
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      java: 17
+    scripts:
+      - name: Gerar Gradle Wrapper (gradlew não está versionado no repo)
+        script: |
+          cd android
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 8.7
+          fi
+          chmod +x ./gradlew
+
+      - name: Entrar na pasta android e buildar
+        script: |
+          cd android
+          ./gradlew assembleDebug --stacktrace
+
+    artifacts:
+      - android/app/build/outputs/apk/debug/*.apk

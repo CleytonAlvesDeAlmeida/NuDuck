@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Rede local: sem localização nem microfone. A câmera é usada só para
+         ler o QR Code de conexão mostrado na janela do NuDuck Server. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- Só usada se "Iniciar ao ligar o celular" estiver marcado nas Configurações
+         (ver BootReceiver); é uma permissão "normal", concedida automaticamente
+         na instalação, sem diálogo pro usuário. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:name=".DroidMonitorApplication"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.DroidMonitor"
+        android:usesCleartextTraffic="true"
+        android:resizeableActivity="true"
+        android:supportsRtl="true">
+        <!--
+          usesCleartextTraffic=true: necessário porque a sinalização WebSocket
+          (ws://, não wss://) roda em texto claro dentro da rede local.
+          O vídeo em si (WebRTC) é sempre criptografado via DTLS/SRTP,
+          independente desta flag.
+
+          resizeableActivity=true: permite multi-janela e telas dobráveis
+          (Android 7+) redimensionarem a Activity livremente em vez de
+          forçar modo de compatibilidade.
+        -->
+
+        <!--
+          android:screenOrientation não é definido: deixamos o Android decidir
+          livremente (retrato/paisagem, celular/tablet/dobrável/Chromebook)
+          em vez de travar em "fullSensor", que ainda restringia a orientação
+          em dispositivos com política de rotação própria (Chromebook/TV).
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+    <!-- Câmera é opcional (só usada no QR Code); toque também é opcional,
+         já que o vídeo remoto pode ser só espelhado sem controle. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+</manifest>

@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NuDuck</string>
+
+    <!-- Descoberta -->
+    <string name="discovery_qr_code">QR Code</string>
+    <string name="discovery_cable">Via cabo (USB)</string>
+    <string name="discovery_pcs_found">PCs encontrados:</string>
+    <string name="discovery_searching">Procurando PCs na rede Wi-Fi</string>
+    <string name="discovery_searching_hint">(ou use adb forward para conectar via USB)</string>
+    <string name="discovery_connect_button">Conectar</string>
+    <string name="discovery_settings_cd">Configurações</string>
+
+    <!-- PIN -->
+    <string name="pin_entry_title">Conectar a %1$s</string>
+    <string name="pin_entry_subtitle">Digite o PIN exibido na tela do PC:</string>
+    <string name="pin_entry_label">PIN de 6 dígitos</string>
+    <string name="pin_entry_cancel">Cancelar</string>
+    <string name="pin_entry_connect">Conectar</string>
+    <string name="pin_entry_mode_label">Tipo de conexão</string>
+    <string name="pin_entry_mode_mirror">Espelhar</string>
+    <string name="pin_entry_mode_mirror_hint">Repete a tela do PC no celular</string>
+    <string name="pin_entry_mode_extend">Estender</string>
+    <string name="pin_entry_mode_extend_hint">Celular vira uma segunda tela (se o PC suportar)</string>
+
+    <!-- Conectando / erro -->
+    <string name="connecting_title">Conectando…</string>
+    <string name="error_title">Não foi possível conectar</string>
+    <string name="error_dismiss">Voltar</string>
+    <string name="mode_fallback_notice">"Estender" não disponível neste PC — conectado em modo Espelhar.</string>
+    <string name="pc_via_cable">PC via cabo (USB)</string>
+    <string name="pc_via_qrcode">PC via QR Code</string>
+    <string name="qr_invalid">QR Code inválido. Escaneie o código exibido pelo NuDuck Server.</string>
+    <string name="pin_too_many_attempts">Muitas tentativas de PIN erradas. Tente novamente em instantes.</string>
+    <string name="pin_incorrect">PIN incorreto. Tente novamente.</string>
+    <string name="signaling_closed_by_pc">Conexão encerrada pelo PC.</string>
+
+    <!-- Configurações -->
+    <string name="settings_title">Configurações</string>
+    <string name="settings_back_cd">Voltar</string>
+    <string name="settings_section_video">Vídeo</string>
+    <string name="settings_quality_label">Qualidade padrão</string>
+    <string name="settings_quality_hint">Usada na próxima vez que conectar em um PC</string>
+    <string name="settings_quality_auto">Automático</string>
+    <string name="settings_section_screen_mode">Segunda tela</string>
+    <string name="settings_mode_label">Modo padrão de conexão</string>
+    <string name="settings_mode_hint">Pode ser trocado a cada conexão, na tela de PIN</string>
+    <string name="settings_section_control">Tela e controle</string>
+    <string name="settings_control_label">Permitir controle por toque</string>
+    <string name="settings_control_hint">Envia toques/cliques ao PC (ele também precisa permitir)</string>
+    <string name="settings_remember_pin_label">Lembrar PIN dos PCs</string>
+    <string name="settings_remember_pin_hint">Evita digitar o PIN de novo da próxima vez</string>
+    <string name="settings_section_appearance">Aparência</string>
+    <string name="settings_theme_label">Tema</string>
+    <string name="settings_theme_system">Automático (do sistema)</string>
+    <string name="settings_theme_light">Claro</string>
+    <string name="settings_theme_dark">Escuro</string>
+    <string name="settings_language_label">Idioma</string>
+    <string name="settings_section_startup">Inicialização</string>
+    <string name="settings_launch_on_boot_label">Iniciar ao ligar o celular</string>
+    <string name="settings_launch_on_boot_hint">Abre o NuDuck sozinho assim que o aparelho terminar de ligar</string>
+    <string name="settings_about_text">NuDuck estende a tela de um PC Linux para o celular via WebRTC, direto na rede local — sem nuvem e sem cadastro.</string>
+
+    <!-- Menu flutuante (durante a conexão) -->
+    <string name="menu_open_cd">Abrir menu NuDuck</string>
+    <string name="menu_quality">Qualidade</string>
+    <string name="menu_settings">Configuração</string>
+    <string name="menu_disconnect">Desconectar</string>
+    <string name="menu_back">Voltar</string>
+    <string name="menu_quality_selected_cd">Qualidade selecionada</string>
+
+    <!-- Leitura de QR Code -->
+    <string name="qr_scan_hint">Aponte a câmera para o QR Code exibido no PC</string>
+    <string name="qr_scan_permission_needed">Precisamos da câmera para ler o QR Code de conexão.</string>
+    <string name="qr_scan_grant_permission">Permitir acesso à câmera</string>
+    <string name="qr_scan_cancel">Cancelar</string>
+</resources>

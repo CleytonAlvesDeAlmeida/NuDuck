@@ -1,0 +1,54 @@
+# ============================================================
+# Python (server/)
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+env/
+.venv/
+.env
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================================
+# Android / Gradle (android/)
+# ============================================================
+*.iml
+.gradle/
+build/
+android/app/build/
+android/build/
+/local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Keystores de assinatura (nunca versionar)
+*.jks
+*.keystore
+
+# ============================================================
+# Android Studio / IntelliJ
+# ============================================================
+.idea/
+*.hprof
+.navigation/
+.DS_Store
+
+# Gradle wrapper jar é opcional versionar; se preferir baixá-lo
+# sempre via `gradle wrapper`, descomente a linha abaixo:
+# gradle/wrapper/gradle-wrapper.jar
+
+# ============================================================
+# Diversos
+# ============================================================
+*.log
+*.bak
+*.tmp
