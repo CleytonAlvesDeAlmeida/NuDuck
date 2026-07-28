@@ -313,8 +313,24 @@ class ScreenCaptureTrack(VideoStreamTrack):
         if not (0 <= rel_x < src_w and 0 <= rel_y < src_h):
             return  # cursor em outro monitor
 
+        self._draw_cursor_arrow(pil_img, rel_x, rel_y, src_w, src_h)
+
+    def _draw_cursor_arrow(self, pil_img, cursor_x, cursor_y, src_w, src_h):
+        """Desenha uma seta de cursor em (cursor_x, cursor_y) do frame original.
+
+        Parâmetros:
+            pil_img:    imagem PIL (já redimensionada para o target)
+            cursor_x:   posição X do cursor no display original (pixels)
+            cursor_y:   posição Y do cursor no display original (pixels)
+            src_w:      largura do display original (pixels)
+            src_h:      altura do display original (pixels)
+        """
+        if not (0 <= cursor_x < src_w and 0 <= cursor_y < src_h):
+            return  # cursor fora da área
+
         scale = pil_img.height / src_h
-        x, y = rel_x * scale, rel_y * scale
+        x = cursor_x * scale
+        y = cursor_y * scale
 
         s = max(10, int(pil_img.height * 0.035))
         points = [
@@ -325,6 +341,23 @@ class ScreenCaptureTrack(VideoStreamTrack):
         ]
         draw = ImageDraw.Draw(pil_img)
         draw.polygon(points, fill=(255, 255, 255), outline=(0, 0, 0))
+
+    def _draw_cursor_virtual(self, pil_img, src_w, src_h):
+        """Desenha o cursor no display virtual Xvfb.
+
+        Usa xdotool getmouselocation no DISPLAY do Xvfb para pegar a
+        posição do mouse e desenha a seta sobre o frame.
+        """
+        if not self._virtual_display or not self._virtual_display.is_running():
+            return
+        try:
+            pos = self._virtual_display.get_mouse_position()
+            if pos is None:
+                return
+            cx, cy = pos
+            self._draw_cursor_arrow(pil_img, cx, cy, src_w, src_h)
+        except Exception:
+            pass
 
     def _resample_filter(self, target_h: int) -> int:
         """Filtro de reamostragem: NEAREST (mais leve) para as qualidades mais
@@ -372,6 +405,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
                 pil_img = Image.fromarray(frame_bgr)
                 pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))
+
+                # Desenha cursor do mouse no display virtual (Xvfb não renderiza cursor)
+                self._draw_cursor_virtual(pil_img, src_w, src_h)
+
                 out = np.ascontiguousarray(np.array(pil_img))
                 return VideoFrame.from_ndarray(out, format="bgr24")
 

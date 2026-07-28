@@ -609,6 +609,47 @@ root.mainloop()
         # Thread não produziu frame — gera frame colorido de fallback
         return np.full(self._shape, [46, 26, 26], dtype=np.uint8)
 
+    def get_mouse_position(self):
+        """Retorna a posição (x, y) do mouse no display virtual via xdotool.
+
+        Retorna (x, y) inteiros se sucesso, ou None se não conseguir.
+        Usa xdotool getmouselocation com DISPLAY do Xvfb.
+        """
+        if not self._started or not self.display_name:
+            return None
+        if not shutil.which("xdotool"):
+            return None
+
+        env = {**os.environ, "DISPLAY": self.display_name}
+        try:
+            result = subprocess.run(
+                ["xdotool", "getmouselocation", "--shell"],
+                env=env, capture_output=True, text=True, timeout=1,
+            )
+            if result.returncode != 0:
+                return None
+
+            # Parse saída: x=123\ny=456\n...
+            x = y = None
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line.startswith("X="):
+                    try:
+                        x = int(line.split("=")[1])
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("Y="):
+                    try:
+                        y = int(line.split("=")[1])
+                    except (ValueError, IndexError):
+                        pass
+
+            if x is not None and y is not None:
+                return (x, y)
+            return None
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Input (toque do celular -> Xvfb via xdotool)
     # ------------------------------------------------------------------
