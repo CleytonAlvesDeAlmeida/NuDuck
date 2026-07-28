@@ -152,8 +152,8 @@ class XvfbVirtualDisplay:
         # Inicia captura (thread, não processo — sem leak de memória compartilhada)
         self._start_capture_thread()
 
-        # Espera um pouco e verifica se a captura está funcionando
-        time.sleep(1.5)
+        # Espera captura estabilizar e verifica
+        time.sleep(3.0)
         if self._new_frame_event and self._new_frame_event.is_set():
             self._capture_ok = True
             log.info("Captura do Xvfb funcionando.")
@@ -214,28 +214,96 @@ class XvfbVirtualDisplay:
     def _open_initial_terminal(self, env):
         """Abre um terminal no display virtual.
 
-        Prefer xterm — funciona com Xvfb e não usa D-Bus.
-        gnome-terminal ignora DISPLAY e abre no monitor físico.
+        Prioriza xterm (respeita DISPLAY, não usa D-Bus).
+        Se nenhum terminal gráfico funcionar, cria um launcher Tkinter.
         """
-        terminals = ("xterm", "uxterm", "lxterminal", "konsole", "gnome-terminal")
-        for term in terminals:
-            if shutil.which(term):
+        opened = False
+
+        # Lista de terminais: xterm primeiro (mais confiável com Xvfb)
+        terminals = [
+            ("xterm", []),
+            ("uxterm", []),
+            ("lxterminal", []),
+            ("x-terminal-emulator", []),  # Debian/Ubuntu alternative
+            ("konsole", []),
+            # gnome-terminal por último — usa D-Bus e pode abrir no monitor errado
+            ("gnome-terminal", ["--disable-factory"]),
+        ]
+
+        for term_name, extra_args in terminals:
+            if shutil.which(term_name):
                 try:
-                    args = [term]
-                    if term == "gnome-terminal":
-                        # gnome-terminal usa D-Bus — forçar display via --display
-                        args = ["gnome-terminal", "--display=" + self.display_name, "--"]
+                    args = [term_name] + extra_args
+                    if term_name == "gnome-terminal":
+                        args += ["--"]
                     subprocess.Popen(
                         args + ["/bin/bash"],
                         env=env,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    log.info("Terminal '%s' aberto em %s", term, self.display_name)
-                    return
+                    log.info("Terminal '%s' aberto em %s", term_name, self.display_name)
+                    opened = True
+                    break
                 except Exception:
                     continue
-        log.warning("Nenhum terminal encontrado.")
+
+        if not opened:
+            log.warning("Nenhum terminal gráfico encontrado. Criando launcher Tkinter...")
+            self._open_tkinter_launcher(env)
+
+    def _open_tkinter_launcher(self, env):
+        """Cria uma janela Tkinter simples no Xvfb como fallback de terminal."""
+        try:
+            script = f'''
+import tkinter as tk
+import subprocess, os
+
+os.environ["DISPLAY"] = "{self.display_name}"
+root = tk.Tk()
+root.title("NuDuck - Segunda Tela")
+root.geometry("500x350")
+root.configure(bg="#1a1a2e")
+
+lbl = tk.Label(root, text="NuDuck - Display Virtual", fg="white", bg="#1a1a2e",
+               font=("Sans", 14, "bold"))
+lbl.pack(pady=(10, 5))
+
+lbl2 = tk.Label(root, text="Digite um comando e pressione Enter:", fg="#aaaaaa", bg="#1a1a2e",
+                font=("Sans", 10))
+lbl2.pack(pady=(0, 5))
+
+entry = tk.Entry(root, font=("Consolas", 11), bg="#16213e", fg="white", insertbackground="white")
+entry.pack(fill="x", padx=15, pady=2)
+
+def run_cmd(event=None):
+    cmd = entry.get().strip()
+    if cmd:
+        entry.delete(0, "end")
+        subprocess.Popen(cmd.split(), env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+entry.bind("<Return>", run_cmd)
+
+btn = tk.Button(root, text="Abrir", command=run_cmd, bg="#0f3460", fg="white",
+                font=("Sans", 10))
+btn.pack(pady=5)
+
+hint = tk.Label(root, text='Exemplos: firefox, nautilus, xterm\\n'
+               'Ou no terminal do PC: DISPLAY={self.display_name} nome_do_app &',
+               fg="#666666", bg="#1a1a2e", font=("Sans", 9), justify="center")
+hint.pack(pady=10)
+
+root.mainloop()
+'''
+            subprocess.Popen(
+                ["python3", "-c", script],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log.info("Launcher Tkinter criado em %s", self.display_name)
+        except Exception as exc:
+            log.warning("Falha ao criar launcher Tkinter: %s", exc)
 
     def _start_capture_thread(self):
         """Inicia thread que captura o framebuffer do Xvfb."""
@@ -251,49 +319,42 @@ class XvfbVirtualDisplay:
         self._capture_thread.start()
 
     def _capture_loop(self):
-        """Loop de captura — roda em thread, usa subprocess (sem conflito X11).
+        """Loop de captura — testa métodos na inicialização, usa o melhor.
 
-        Tenta xwd primeiro. Se falhar, gera frame colorido (nunca preto).
+        Fase 1 (setup): testa xwd com timeout. Se falhar, tenta alternativas.
+        Fase 2 (loop):  usa o método que funcionou, a ~30fps.
         """
         display_name = self.display_name
         capture_fn = None
+        _fail_count = [0]  # mutable counter para closure
+        MAX_FAIL = 50  # após N falhas seguidas, tenta outro método
 
-        # --- Método 1: xwd (X Window Dump) — subprocesso, sem conflito X11 ---
+        # ===== FASE 1: Encontrar método de captura que funciona =====
+
+        # Método 1: xwd (X Window Dump)
         if shutil.which("xwd"):
-            log.info("Captura via xwd ativa em %s", display_name)
+            log.info("Testando captura via xwd em %s...", display_name)
+            fn = self._test_xwd(display_name)
+            if fn is not None:
+                capture_fn = fn
+                log.info("Captura via xwd OK em %s", display_name)
+            else:
+                log.warning("xwd falhou em %s, tentando outro método", display_name)
 
-            def capture_xwd():
-                try:
-                    proc = subprocess.Popen(
-                        ["xwd", "-root", "-display", display_name],
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        env={**os.environ, "DISPLAY": display_name},
-                    )
-                    xwd_data = proc.stdout.read()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+        # Método 2: ImageMagick import
+        if capture_fn is None and shutil.which("import"):
+            log.info("Testando captura via ImageMagick import em %s...", display_name)
+            fn = self._test_imagemagick(display_name)
+            if fn is not None:
+                capture_fn = fn
+                log.info("Captura via ImageMagick import OK em %s", display_name)
+            else:
+                log.warning("ImageMagick import falhou em %s", display_name)
 
-                    if len(xwd_data) > 100:
-                        img_bgr = _xwd_to_bgr(xwd_data, self.width, self.height)
-                        if img_bgr is not None:
-                            with self._frame_lock:
-                                np.copyto(self._latest_frame, img_bgr)
-                            self._new_frame_event.set()
-                            return
-                except Exception:
-                    pass
-                # Se xwd falhou neste frame, não faz nada (mantém frame anterior)
-
-            capture_fn = capture_xwd
-        else:
-            log.warning("xwd não encontrado. Instale: sudo apt install x11-utils")
-
-        # --- Método 2: frame colorido de fallback (nunca preto) ---
+        # Método 3: fallback colorido
         if capture_fn is None:
-            log.warning("Nenhum método de captura disponível, usando frame colorido")
-            bg = np.full((self.height, self.width, 3), [46, 26, 26], dtype=np.uint8)  # azul escuro BGR
+            log.warning("Nenhum método de captura funcionou. Usando frame colorido.")
+            bg = np.full((self.height, self.width, 3), [46, 26, 26], dtype=np.uint8)
 
             def capture_fallback():
                 with self._frame_lock:
@@ -302,13 +363,168 @@ class XvfbVirtualDisplay:
 
             capture_fn = capture_fallback
 
-        # Loop principal — captura a ~30fps
+        # ===== FASE 2: Loop de captura =====
         while not self._stop_event.is_set():
             try:
                 capture_fn()
+                _fail_count[0] = 0
             except Exception:
-                pass
-            self._stop_event.wait(0.033)
+                _fail_count[0] += 1
+                if _fail_count[0] == MAX_FAIL:
+                    log.error("Captura falhou %dx consecutivas!", MAX_FAIL)
+            self._stop_event.wait(0.033)  # ~30fps
+
+    def _test_xwd(self, display_name):
+        """Testa se xwd funciona. Retorna função de captura ou None."""
+        try:
+            proc = subprocess.Popen(
+                ["xwd", "-root", "-display", display_name],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**os.environ, "DISPLAY": display_name},
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=1)
+                log.warning("xwd: timeout (não respondeu em 3s)")
+                return None
+
+            if proc.returncode != 0:
+                err = stderr.decode(errors="replace").strip()[:200]
+                log.warning("xwd: erro (rc=%d): %s", proc.returncode, err)
+                return None
+
+            if len(stdout) < 100:
+                log.warning("xwd: dados insuficientes (%d bytes)", len(stdout))
+                return None
+
+            # Tenta converter
+            img = _xwd_to_bgr(stdout, self.width, self.height)
+            if img is None:
+                log.warning("xwd: dados recebidos mas parser falhou")
+                return None
+
+            log.info("xwd OK — frame %dx%d, tamanho=%d bytes", img.shape[1], img.shape[0], len(stdout))
+
+            # Salva primeiro frame
+            with self._frame_lock:
+                np.copyto(self._latest_frame, img)
+            self._new_frame_event.set()
+
+            # Retorna função de captura rápida para o loop
+            shape = self._shape
+
+            def capture_xwd():
+                try:
+                    p = subprocess.Popen(
+                        ["xwd", "-root", "-display", display_name],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        env={**os.environ, "DISPLAY": display_name},
+                    )
+                    try:
+                        out, _ = p.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.communicate(timeout=0.5)
+                        return
+                    if p.returncode == 0 and len(out) > 100:
+                        result = _xwd_to_bgr(out, shape[1], shape[0])
+                        if result is not None:
+                            with self._frame_lock:
+                                np.copyto(self._latest_frame, result)
+                            self._new_frame_event.set()
+                except Exception:
+                    pass
+
+            return capture_xwd
+
+        except Exception as exc:
+            log.warning("xwd exception: %s", exc)
+            return None
+
+    def _test_imagemagick(self, display_name):
+        """Testa captura via ImageMagick 'import'. Retorna função ou None."""
+        try:
+            proc = subprocess.Popen(
+                ["import", "-display", display_name, "-window", "root",
+                 "-depth", "24", "png:-"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**os.environ, "DISPLAY": display_name},
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=1)
+                log.warning("ImageMagick: timeout")
+                return None
+
+            if proc.returncode != 0:
+                err = stderr.decode(errors="replace").strip()[:200]
+                log.warning("ImageMagick: erro (rc=%d): %s", proc.returncode, err)
+                return None
+
+            if len(stdout) < 100:
+                log.warning("ImageMagick: dados insuficientes (%d bytes)", len(stdout))
+                return None
+
+            # Converte PNG para numpy
+            import io
+            from PIL import Image
+            img_pil = Image.open(io.BytesIO(stdout)).convert("RGB")
+            img_rgb = np.array(img_pil)
+            img_bgr = img_rgb[:, :, ::-1].copy()
+
+            # Redimensiona se necessário
+            if img_bgr.shape[:2] != (self.height, self.width):
+                from PIL import Image as PILImage
+                pil = PILImage.fromarray(img_rgb)
+                pil = pil.resize((self.width, self.height), PILImage.BILINEAR)
+                img_bgr = np.array(pil)[:, :, ::-1].copy()
+
+            with self._frame_lock:
+                np.copyto(self._latest_frame, img_bgr)
+            self._new_frame_event.set()
+            log.info("ImageMagick import OK — frame %dx%d", img_bgr.shape[1], img_bgr.shape[0])
+
+            shape = self._shape
+
+            def capture_magick():
+                try:
+                    p = subprocess.Popen(
+                        ["import", "-display", display_name, "-window", "root",
+                         "-depth", "24", "png:-"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        env={**os.environ, "DISPLAY": display_name},
+                    )
+                    try:
+                        out, _ = p.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.communicate(timeout=0.5)
+                        return
+                    if p.returncode == 0 and len(out) > 100:
+                        pil = Image.open(io.BytesIO(out)).convert("RGB")
+                        arr = np.array(pil)[:, :, ::-1]
+                        if arr.shape[:2] != (shape[0], shape[1]):
+                            pil2 = PILImage.fromarray(arr[:, :, ::-1])
+                            pil2 = pil2.resize((shape[1], shape[0]), PILImage.BILINEAR)
+                            arr = np.array(pil2)[:, :, ::-1]
+                        with self._frame_lock:
+                            np.copyto(self._latest_frame, arr)
+                        self._new_frame_event.set()
+                except Exception:
+                    pass
+
+            return capture_magick
+
+        except ImportError:
+            log.warning("PIL/Pillow não encontrado para ImageMagick fallback")
+            return None
+        except Exception as exc:
+            log.warning("ImageMagick exception: %s", exc)
+            return None
 
     def stop(self):
         """Para o Xvfb, WM, captura e limpa os arquivos de socket."""
@@ -446,11 +662,10 @@ def _xwd_to_bgr(data, expected_w, expected_h):
       Offset  0: header_size
       Offset 12: pixmap_width
       Offset 16: pixmap_height
-      Offset 40: depth (bits por pixel significativos: 24 ou 32)
-      Offset 44: bytes_per_line (bytes por linha, pode ter padding)
+      Offset 40: bits_per_pixel (24 ou 32)
+      Offset 44: bytes_per_line (pode ter padding)
       Offset 48: visual_class
       Offset 52: red_mask
-      Offset 56: green_mask
       Offset 60: blue_mask
     Os dados do pixel começam em data[header_size:].
     """
@@ -462,13 +677,17 @@ def _xwd_to_bgr(data, expected_w, expected_h):
         header_size = struct.unpack(">I", data[0:4])[0]
         width = struct.unpack(">I", data[12:16])[0]
         height = struct.unpack(">I", data[16:20])[0]
-        depth = struct.unpack(">I", data[40:44])[0]
+        bpp = struct.unpack(">I", data[40:44])[0]
         bytes_per_line = struct.unpack(">I", data[44:48])[0]
         red_mask = struct.unpack(">I", data[52:56])[0]
         blue_mask = struct.unpack(">I", data[60:64])[0]
 
-        if depth not in (24, 32):
-            log.debug("XWD: profundidade %d não suportada (precisa 24 ou 32)", depth)
+        if bpp not in (24, 32):
+            log.debug("XWD: bpp=%d não suportado (precisa 24 ou 32)", bpp)
+            return None
+
+        if header_size < 100 or header_size > 10000:
+            log.debug("XWD: header_size=%d suspeito", header_size)
             return None
 
         pixel_data = data[header_size:]
@@ -479,26 +698,23 @@ def _xwd_to_bgr(data, expected_w, expected_h):
             log.debug("XWD: dados insuficientes (tem %d, precisa %d)", len(pixel_data), needed)
             return None
 
-        # Calcula bytes por pixel a partir de bytes_per_line e width
-        actual_bpp = bytes_per_line // width if width > 0 else depth // 8
+        # Bytes por pixel (arredondado)
+        actual_bpp = bytes_per_line // width if width > 0 else bpp // 8
 
-        # Extrai pixels: reshape linha por linha, depois pega só os canais BGR
+        # Extrai pixels: reshape linha por linha
         raw = np.frombuffer(pixel_data[:needed], dtype=np.uint8)
         raw = raw.reshape((height, bytes_per_line))
 
         # Pega a largura correta e só 3 canais (BGR)
         valid_w = min(width, expected_w)
-        img = raw[:, :valid_w * actual_bpp].reshape((height, valid_w, actual_bpp))
+        valid_h = min(height, expected_h)
+        img = raw[:valid_h, :valid_w * actual_bpp].reshape((valid_h, valid_w, actual_bpp))
         img = img[:, :, :3].copy()
-
-        # Corta para a altura esperada
-        img = img[:min(height, expected_h)]
 
         # XWD é bottom-up — inverte verticalmente
         img = np.flipud(img)
 
         # Detecta ordem das cores pelos masks
-        # Se red_mask < blue_mask → dados estão em ordem RGB, inverter para BGR
         if red_mask > 0 and blue_mask > 0 and red_mask < blue_mask:
             img = img[:, :, ::-1].copy()
 
