@@ -332,6 +332,24 @@ class ScreenCaptureTrack(VideoStreamTrack):
         ajuda hardware fraco; BILINEAR (mais suave) do 480p pra cima."""
         return Image.NEAREST if target_h <= 240 else Image.BILINEAR
 
+    def _aligned_dimensions(self, src_w: int, src_h: int, target_h: int) -> tuple:
+        """Calcula (largura, altura) de saída arredondadas para múltiplos de 16px.
+
+        Codecs de vídeo (VP8/H.264, usados pelo aiortc) trabalham internamente
+        em blocos de 16x16 pixels. Quando a largura ou altura pedida não é
+        múltipla de 16, o codec completa o "resto" com dados de preenchimento
+        (às vezes lixo de memória) — isso aparecia como uma faixa
+        branca/cinza colada numa borda do vídeo, mais visível no modo
+        Estender quando o celular ficava na vertical (o vídeo era esticado
+        pra ocupar a tela toda, ampliando essa faixa). Arredondar as
+        dimensões pra múltiplos de 16 antes de gerar o frame elimina esse
+        preenchimento.
+        """
+        aligned_h = max(16, round(target_h / 16) * 16)
+        raw_w = src_w * (aligned_h / src_h)
+        aligned_w = max(16, round(raw_w / 16) * 16)
+        return aligned_w, aligned_h
+
     def _capture_and_convert(self):
         """Captura a tela e converte para frame do WebRTC.
 
@@ -350,8 +368,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
             frame_bgr = self._virtual_display.get_frame()
             if frame_bgr is not None:
                 src_h, src_w = frame_bgr.shape[:2]
-                target_h = self._target_h
-                target_w = max(2, int(round(src_w * (target_h / src_h) / 2)) * 2)
+                target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
                 pil_img = Image.fromarray(frame_bgr)
                 pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))
@@ -378,8 +395,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         img = np.array(raw)[:, :, :3]  # BGRA -> BGR (fica em BGR o tempo todo)
         src_h, src_w = img.shape[:2]
 
-        target_h = self._target_h
-        target_w = max(2, int(round(src_w * (target_h / src_h) / 2)) * 2)
+        target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
         pil_img = Image.fromarray(img)
         pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))

@@ -724,9 +724,6 @@ def _xwd_to_bgr(data, expected_w, expected_h):
         img = raw[:valid_h, :valid_w * actual_bpp].reshape((valid_h, valid_w, actual_bpp))
         img = img[:, :, :3].copy()
 
-        # XWD é bottom-up — inverte
-        img = np.flipud(img)
-
         # Detecta ordem RGB vs BGR pelos masks
         if red_mask > 0 and blue_mask > 0 and red_mask < blue_mask:
             img = img[:, :, ::-1].copy()
