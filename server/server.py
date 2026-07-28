@@ -40,6 +40,7 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
+from PIL import Image, ImageDraw
 from zeroconf import ServiceInfo, Zeroconf
 
 # Display virtual Xvfb (abordagem SpaceDesk para o modo Estender)
@@ -315,7 +316,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
         scale = pil_img.height / src_h
         x, y = rel_x * scale, rel_y * scale
 
-        from PIL import ImageDraw
         s = max(10, int(pil_img.height * 0.035))
         points = [
             (x, y), (x, y + s),
@@ -326,8 +326,24 @@ class ScreenCaptureTrack(VideoStreamTrack):
         draw = ImageDraw.Draw(pil_img)
         draw.polygon(points, fill=(255, 255, 255), outline=(0, 0, 0))
 
+    def _resample_filter(self, target_h: int) -> int:
+        """Filtro de reamostragem: NEAREST (mais leve) para as qualidades mais
+        baixas, onde a perda de nitidez é imperceptível e a economia de CPU
+        ajuda hardware fraco; BILINEAR (mais suave) do 480p pra cima."""
+        return Image.NEAREST if target_h <= 240 else Image.BILINEAR
+
     def _capture_and_convert(self):
-        """Captura a tela e converte para frame do WebRTC."""
+        """Captura a tela e converte para frame do WebRTC.
+
+        Nota de performance: a imagem circula internamente como BGR do
+        início ao fim (é assim que mss/Xvfb entregam e é assim que
+        VideoFrame.from_ndarray(..., format="bgr24") espera). Antes esse
+        método convertia pra RGB só pro PIL redimensionar e convertia de
+        volta pra BGR depois — dois "flips" de canais por frame que não
+        mudavam o resultado (redimensionar e desenhar o cursor branco/preto
+        não dependem da ordem R/G/B). Remover esses dois flips reduz o
+        trabalho de CPU por frame sem alterar a imagem final.
+        """
 
         # --- Caminho do display virtual Xvfb ---
         if self._virtual_display and self._virtual_display.is_running():
@@ -337,10 +353,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 target_h = self._target_h
                 target_w = max(2, int(round(src_w * (target_h / src_h) / 2)) * 2)
 
-                from PIL import Image
-                pil_img = Image.fromarray(frame_bgr[:, :, ::-1])
-                pil_img = pil_img.resize((target_w, target_h), Image.BILINEAR)
-                out = np.ascontiguousarray(np.array(pil_img)[:, :, ::-1])
+                pil_img = Image.fromarray(frame_bgr)
+                pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))
+                out = np.ascontiguousarray(np.array(pil_img))
                 return VideoFrame.from_ndarray(out, format="bgr24")
 
             # get_frame() retornou None (não deveria acontecer mais)
@@ -360,19 +375,18 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 self._monitor = self._sct.monitors[self._monitor_index]
 
         raw = self._sct.grab(self._monitor)
-        img = np.array(raw)[:, :, :3]  # BGRA -> BGR
+        img = np.array(raw)[:, :, :3]  # BGRA -> BGR (fica em BGR o tempo todo)
         src_h, src_w = img.shape[:2]
 
         target_h = self._target_h
         target_w = max(2, int(round(src_w * (target_h / src_h) / 2)) * 2)
 
-        from PIL import Image
-        pil_img = Image.fromarray(img[:, :, ::-1])  # BGR -> RGB
-        pil_img = pil_img.resize((target_w, target_h), Image.BILINEAR)
+        pil_img = Image.fromarray(img)
+        pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))
 
         self._draw_cursor(pil_img)
 
-        out = np.ascontiguousarray(np.array(pil_img)[:, :, ::-1])  # RGB -> BGR
+        out = np.ascontiguousarray(np.array(pil_img))
         return VideoFrame.from_ndarray(out, format="bgr24")
 
     async def recv(self):
@@ -640,16 +654,49 @@ async def status_handler(request: web.Request):
 # ==========================================================================
 
 USB_STATUS_LABELS = {
-    "checking":    ("Cabo USB: verificando...", "gray"),
-    "connected":   ("Cabo USB: pronto ✅", "#2e7d32"),
-    "no_device":   ("Cabo USB: plugue e autorize depuração", "gray"),
-    "adb_missing": ("Cabo USB: 'adb' não encontrado", "gray"),
-    "error":       ("Cabo USB: erro ao verificar", "gray"),
+    "checking":     ("Cabo USB: verificando...", "gray"),
+    "connected":    ("Cabo USB: pronto ✅", "#2e7d32"),
+    "no_device":    ("Cabo USB: plugue e autorize depuração", "gray"),
+    "unauthorized": ("Cabo USB: autorize a depuração no celular", "#b26a00"),
+    "adb_missing":  ("Cabo USB: 'adb' não encontrado", "gray"),
+    "error":        ("Cabo USB: erro ao aplicar adb reverse", "#c62828"),
 }
 
 
+def _parse_adb_devices(output: str) -> tuple[list[str], list[str]]:
+    """Extrai (seriais_autorizados, seriais_nao_autorizados) da saída de `adb devices`."""
+    ready: list[str] = []
+    unauthorized: list[str] = []
+    for line in output.splitlines()[1:]:  # primeira linha é o cabeçalho "List of devices attached"
+        line = line.strip()
+        if not line or line.startswith("*"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        serial, state = parts[0].strip(), parts[1].strip()
+        if not serial:
+            continue
+        if state == "device":
+            ready.append(serial)
+        elif state == "unauthorized":
+            unauthorized.append(serial)
+    return ready, unauthorized
+
+
 def _adb_reverse_loop():
-    """Verifica se tem celular plugado e aplica adb reverse sozinho."""
+    """Verifica se tem celular plugado e aplica `adb reverse` sozinho.
+
+    Importante: o comando precisa mirar um serial específico (`adb -s <serial>
+    reverse ...`). Sem isso, o adb recusa a operação com "error: more than one
+    device/emulator" sempre que há mais de um dispositivo visível — o que é
+    comum mesmo com só o cabo plugado, pois muitos celulares recentes têm
+    "depuração sem fio" (adb por Wi-Fi) habilitada ao mesmo tempo, ou o PC
+    tem um emulador/outro aparelho já pareado. Esse era o motivo do botão
+    "Via cabo" às vezes não funcionar: o `adb reverse` global falhava
+    silenciosamente e o app tentava conversar com um servidor que não
+    existia em 127.0.0.1.
+    """
     adb = shutil.which("adb")
     if adb is None:
         log.info("adb não encontrado; modo USB desativado.")
@@ -659,18 +706,29 @@ def _adb_reverse_loop():
     while True:
         try:
             result = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=5)
-            lines = [ln for ln in result.stdout.splitlines()[1:] if ln.strip()]
-            devices = [ln.split("\t")[0] for ln in lines if ln.endswith("\tdevice")]
+            ready, unauthorized = _parse_adb_devices(result.stdout)
 
-            if devices:
-                rev = subprocess.run(
-                    [adb, "reverse", f"tcp:{PORT}", f"tcp:{PORT}"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                STATE.usb_status = "connected" if rev.returncode == 0 else "error"
+            if ready:
+                any_ok = False
+                for serial in ready:
+                    rev = subprocess.run(
+                        [adb, "-s", serial, "reverse", f"tcp:{PORT}", f"tcp:{PORT}"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if rev.returncode == 0:
+                        any_ok = True
+                    else:
+                        log.warning(
+                            "adb reverse falhou para %s: %s",
+                            serial, rev.stderr.strip() or rev.stdout.strip(),
+                        )
+                STATE.usb_status = "connected" if any_ok else "error"
+            elif unauthorized:
+                STATE.usb_status = "unauthorized"
             else:
                 STATE.usb_status = "no_device"
-        except Exception:
+        except Exception as exc:
+            log.warning("Erro ao verificar dispositivos USB: %s", exc)
             STATE.usb_status = "error"
 
         time.sleep(3)
