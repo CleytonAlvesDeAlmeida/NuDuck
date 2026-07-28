@@ -656,72 +656,45 @@ root.mainloop()
 # ----------------------------------------------------------------------
 
 def _xwd_to_bgr(data, expected_w, expected_h):
-    """Converte dados XWD para numpy array BGR.
+    """Converte dados XWD (Format B) para numpy array BGR.
 
-    O header XWD do Xvfb/Xorg (CARD32 big-endian, 4 bytes cada):
-      Offset  0: header_size
-      Offset  4: file_version (7)
-      Offset  8: format (2 = ZPixmap)
-      Offset 12: pixmap_depth    (24 ou 32)
-      Offset 16: pixmap_width
-      Offset 20: pixmap_height
-      Offset 24: x_offset
-      Offset 28: bitmap_unit
-      Offset 32: bitmap_bit_order
-      Offset 36: bitmap_pad
-      Offset 40: bits_per_pixel
-      Offset 44: bytes_per_line
-      Offset 48: visual_class (5 = TrueColor)
-      Offset 52: red_mask
-      Offset 56: green_mask
-      Offset 60: blue_mask
-    Os dados do pixel começam em data[header_size:].
+    Offset table do header XWD (cada campo = CARD32 big-endian = 4 bytes):
+      0: header_size       28: byte_order
+      4: file_version       32: bitmap_unit
+      8: format             36: bitmap_bit_order
+     12: pixmap_depth       40: bitmap_pad
+     16: pixmap_width       44: bits_per_pixel
+     20: pixmap_height      48: bytes_per_line
+     24: xoffset            52: visual_class
+                            56: red_mask
+                            60: green_mask
+                            64: blue_mask
+    Pixel data starts at data[header_size:].
     """
     try:
         if len(data) < 100:
             return None
 
-        # Lê campos do header XWD (big-endian)
+        # Lê header XWD (big-endian)
         header_size = struct.unpack(">I", data[0:4])[0]
+        pixmap_width = struct.unpack(">I", data[16:20])[0]
+        pixmap_height = struct.unpack(">I", data[20:24])[0]
+        bits_per_pixel = struct.unpack(">I", data[44:48])[0]
+        bytes_per_line = struct.unpack(">I", data[48:52])[0]
+        red_mask = struct.unpack(">I", data[56:60])[0]
+        green_mask = struct.unpack(">I", data[60:64])[0]
+        blue_mask = struct.unpack(">I", data[64:68])[0]
 
-        # Detecta formato do header:
-        # - Xvfb/Xorg inclui pixmap_depth no offset 12
-        # - Implementações antigas podem não ter
-        field_12 = struct.unpack(">I", data[12:16])[0]
-        field_16 = struct.unpack(">I", data[16:20])[0]
-        field_20 = struct.unpack(">I", data[20:24])[0]
-
-        if field_12 in (1, 4, 8, 15, 16, 24, 32) and field_16 > 10:
-            # Formato Xvfb/Xorg: offset 12 = pixmap_depth
-            pixmap_depth = field_12
-            width = field_16
-            height = field_20
-            bpp = struct.unpack(">I", data[40:44])[0]
-            bytes_per_line = struct.unpack(">I", data[44:48])[0]
-            red_mask = struct.unpack(">I", data[52:56])[0]
-            green_mask = struct.unpack(">I", data[56:60])[0]
-            blue_mask = struct.unpack(">I", data[60:64])[0]
-        elif field_12 > 10:
-            # Formato antigo (sem pixmap_depth): offset 12 = pixmap_width
-            pixmap_depth = 24
-            width = field_12
-            height = field_16
-            bpp = struct.unpack(">I", data[36:40])[0]
-            bytes_per_line = struct.unpack(">I", data[40:44])[0]
-            red_mask = struct.unpack(">I", data[48:52])[0]
-            green_mask = struct.unpack(">I", data[52:56])[0]
-            blue_mask = struct.unpack(">I", data[56:60])[0]
-        else:
-            log.debug("XWD: não conseguiu detectar formato (offset12=%d, offset16=%d)", field_12, field_16)
+        if bits_per_pixel not in (24, 32):
+            log.debug("XWD: bits_per_pixel=%d (precisa 24 ou 32)", bits_per_pixel)
             return None
 
-        if bpp not in (24, 32):
-            log.debug("XWD: bpp=%d não suportado (precisa 24 ou 32)", bpp)
-            return None
-
-        if header_size < 100 or header_size > 10000:
+        if header_size < 100 or header_size > 100000:
             log.debug("XWD: header_size=%d suspeito", header_size)
             return None
+
+        width = pixmap_width
+        height = pixmap_height
 
         if width < 10 or height < 10 or width > 7680 or height > 4320:
             log.debug("XWD: dimensões suspeitas %dx%d", width, height)
@@ -729,30 +702,32 @@ def _xwd_to_bgr(data, expected_w, expected_h):
 
         pixel_data = data[header_size:]
 
-        # Verifica se tem dados suficientes
+        # Verifica dados suficientes
         needed = bytes_per_line * height
         if len(pixel_data) < needed:
             log.debug("XWD: dados insuficientes (tem %d, precisa %d)", len(pixel_data), needed)
             return None
 
-        # Bytes por pixel (arredondado)
-        actual_bpp = bytes_per_line // width if width > 0 else bpp // 8
+        # Bytes por pixel a partir de bytes_per_line
+        actual_bpp = bytes_per_line // width if width > 0 else bits_per_pixel // 8
 
-        # Extrai pixels: reshape linha por linha
+        if actual_bpp < 3:
+            log.debug("XWD: actual_bpp=%d < 3 (bytes_per_line=%d, width=%d)", actual_bpp, bytes_per_line, width)
+            return None
+
+        # Extrai pixels
         raw = np.frombuffer(pixel_data[:needed], dtype=np.uint8)
         raw = raw.reshape((height, bytes_per_line))
 
-        # Pega a largura correta e só 3 canais (BGR)
         valid_w = min(width, expected_w)
         valid_h = min(height, expected_h)
         img = raw[:valid_h, :valid_w * actual_bpp].reshape((valid_h, valid_w, actual_bpp))
         img = img[:, :, :3].copy()
 
-        # XWD é bottom-up — inverte verticalmente
+        # XWD é bottom-up — inverte
         img = np.flipud(img)
 
-        # Detecta ordem das cores pelos masks
-        # Little-endian (x86): red_mask=0xFF, blue_mask=0xFF0000 → red < blue = RGB order
+        # Detecta ordem RGB vs BGR pelos masks
         if red_mask > 0 and blue_mask > 0 and red_mask < blue_mask:
             img = img[:, :, ::-1].copy()
 
