@@ -250,15 +250,12 @@ def get_window_list() -> list:
         return []
 
 
-def capture_window(window_id_hex: str):
-    """Captura o conteúdo de uma janela específica usando xdotool + import.
+def _get_window_geometry(window_id_hex: str):
+    """Pega a geometria (x, y, w, h) de uma janela via xdotool.
 
-    Retorna numpy array BGR da janela, ou None se falhar.
-    Usa xdotool para pegar a geometria da janela e depois recorta
-    da captura completa da tela.
+    Retorna dict {x, y, width, height} ou None se falhar.
     """
     try:
-        # Pegar geometria da janela (x, y, largura, altura)
         geo_result = subprocess.run(
             ["xdotool", "getwindowgeometry", "--shell", window_id_hex],
             capture_output=True, text=True, timeout=1,
@@ -284,35 +281,37 @@ def capture_window(window_id_hex: str):
 
         if x is None or y is None or w is None or h is None or w <= 0 or h <= 0:
             return None
-
-        # Captura a tela completa e recorta a região da janela
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]  # monitor principal
-            raw = sct.grab(monitor)
-            screen = np.array(raw)[:, :, :3]  # BGRA -> BGR
-
-        # Coordenadas relativas ao monitor
-        rel_x = x - monitor["left"]
-        rel_y = y - monitor["top"]
-
-        # Garante que não sai dos limites da tela
-        rel_x = max(0, rel_x)
-        rel_y = max(0, rel_y)
-        max_x = min(rel_x + w, monitor["width"])
-        max_y = min(rel_y + h, monitor["height"])
-        w = max_x - rel_x
-        h = max_y - rel_y
-
-        if w <= 0 or h <= 0:
-            return None
-
-        # Recorta a região da janela
-        window_frame = screen[rel_y:rel_y + h, rel_x:rel_x + w]
-        return window_frame
-
-    except Exception as exc:
-        log.debug("Erro ao capturar janela %s: %s", window_id_hex, exc)
+        return {"x": x, "y": y, "width": w, "height": h}
+    except Exception:
         return None
+
+
+def _crop_window_from_frame(frame_bgr, monitor, geo):
+    """Recorta a região de uma janela de um frame BGR da tela cheia.
+
+    Parâmetros:
+        frame_bgr: numpy array BGR da tela cheia
+        monitor:   dict do monitor do mss (contém left, top, width, height)
+        geo:       dict da geometria da janela {x, y, width, height}
+
+    Retorna numpy array BGR recortado, ou None se fora dos limites.
+    """
+    rel_x = geo["x"] - monitor["left"]
+    rel_y = geo["y"] - monitor["top"]
+    w, h = geo["width"], geo["height"]
+
+    src_h, src_w = frame_bgr.shape[:2]
+
+    # Garante que não sai dos limites
+    rel_x = max(0, rel_x)
+    rel_y = max(0, rel_y)
+    w = min(w, src_w - rel_x)
+    h = min(h, src_h - rel_y)
+
+    if w <= 0 or h <= 0:
+        return None
+
+    return frame_bgr[rel_y:rel_y + h, rel_x:rel_x + w]
 
 
 # ==========================================================================
@@ -335,8 +334,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
     _AUTO_COOLDOWN_SECONDS = 2.5
 
     def __init__(self, quality: str = DEFAULT_QUALITY, mode: str = "mirror",
-                 phone_w: int = 0, phone_h: int = 0,
-                 window_id: str = ""):
+                 phone_w: int = 0, phone_h: int = 0):
         super().__init__()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._sct = None
@@ -347,8 +345,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._virtual_display = None
         self._virtual_display_info = None
 
-        # Modo espelhar janela
-        self._window_id = window_id  # hex string do xdotool
+        # Cache de geometria da janela para modo espelhar janela
+        self._window_geo_cache = None   # {x, y, width, height}
+        self._window_geo_frame = 0       # último frame em que atualizou
 
         # Dimensões da tela do celular (para adaptar o vídeo)
         self._phone_w = phone_w if phone_w > 0 else None
@@ -364,7 +363,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._last_adapt = 0.0
 
         # Decide o modo
-        self.requested_mode = mode if mode in ("mirror", "extend", "window") else "mirror"
+        self.requested_mode = mode if mode in ("mirror", "extend") else "mirror"
         (
             self.resolved_mode,
             self._monitor_index,
@@ -379,19 +378,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
         Retorna (modo_real, índice_do_monitor, região, motivo_do_fallback).
         """
-        # --- Modo Espelhar Janela ---
-        if mode == "window":
-            if not self._window_id:
-                reason = "Nenhuma janela selecionada."
-                log.warning("Modo 'Janela' pedido, mas %s", reason)
-                return "mirror", 1, None, reason
-            if not shutil.which("xdotool"):
-                reason = "xdotool não encontrado. Instale: sudo apt install xdotool"
-                log.warning("Modo 'Janela' pedido, mas %s", reason)
-                return "mirror", 1, None, reason
-            log.info("Modo Espelhar Janela ativado (janela %s).", self._window_id)
-            return "window", 1, None, None
-
         if mode != "extend":
             return "mirror", 1, None, None
 
@@ -651,43 +637,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
             )
             return VideoFrame.from_ndarray(fallback, format="bgr24")
 
-        # --- Caminho 2: Modo Espelhar Janela ---
-        if self.resolved_mode == "window" and self._window_id:
-            frame_bgr = capture_window(self._window_id)
-            if frame_bgr is not None and frame_bgr.size > 0:
-                src_h, src_w = frame_bgr.shape[:2]
-                target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
-
-                # Usa cv2.resize em BGR
-                frame_resized = cv2.resize(frame_bgr, (target_w, target_h),
-                                           interpolation=cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST)
-
-                # BGR -> RGB para PIL (cursor)
-                frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(frame_rgb)
-
-                # Adaptar à resolução do celular se conhecida
-                if self._phone_w and self._phone_h:
-                    phone_w, phone_h = self._phone_w, self._phone_h
-                    a_phone_w = max(16, round(phone_w / 16) * 16)
-                    a_phone_h = max(16, round(phone_h / 16) * 16)
-                    pil_img = self._letterbox(pil_img)
-                    pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
-
-                # PIL RGB -> BGR para VideoFrame
-                out_rgb = np.ascontiguousarray(np.array(pil_img))
-                out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-                return VideoFrame.from_ndarray(out_bgr, format="bgr24")
-
-            # Falha ao capturar janela — gera fallback com mensagem
-            log.debug("Falha ao capturar janela %s", self._window_id)
-            fallback = np.full(
-                (self._target_h, max(2, int(self._target_h * 16 / 9)), 3),
-                [46, 26, 26], dtype=np.uint8,
-            )
-            return VideoFrame.from_ndarray(fallback, format="bgr24")
-
-        # --- Caminho 3: Captura normal com mss (modo Espelhar) ---
+        # --- Caminho 2: Captura normal com mss (modo Espelhar) ---
+        # Se STATE.window_mode=True e janela selecionada, recorta só a janela
+        # do frame completo. A geometria é cacheada (atualizada ~1x/s)
+        # para evitar subprocess por frame.
         if self._sct is None:
             self._sct = mss.mss()
             if self._explicit_region is not None:
@@ -698,6 +651,25 @@ class ScreenCaptureTrack(VideoStreamTrack):
         raw = self._sct.grab(self._monitor)
         img = np.array(raw)[:, :, :3]  # BGRA -> BGR (fica em BGR o tempo todo)
         src_h, src_w = img.shape[:2]
+
+        # --- Modo Espelhar Janela: recorta só a janela selecionada ---
+        if STATE.window_mode and STATE.selected_window_id:
+            # Atualiza cache de geometria a cada ~30 frames (~1x/s)
+            if (self._window_geo_cache is None or
+                    self._frame_count - self._window_geo_frame >= 30):
+                geo = _get_window_geometry(STATE.selected_window_id)
+                if geo is not None:
+                    self._window_geo_cache = geo
+                    self._window_geo_frame = self._frame_count
+                else:
+                    log.debug("Não conseguiu obter geometria da janela %s", STATE.selected_window_id)
+
+            if self._window_geo_cache is not None:
+                cropped = _crop_window_from_frame(img, self._monitor, self._window_geo_cache)
+                if cropped is not None and cropped.size > 0:
+                    img = cropped
+                    src_h, src_w = img.shape[:2]
+                    log.debug("Janela recortada: %dx%d", src_w, src_h)
 
         target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
@@ -895,7 +867,7 @@ async def websocket_handler(request: web.Request):
                 STATE.quality = quality
 
                 requested_mode = data.get("mode", "mirror")
-                if requested_mode not in ("mirror", "extend", "window"):
+                if requested_mode not in ("mirror", "extend"):
                     requested_mode = "mirror"
 
                 pc = RTCPeerConnection()
@@ -905,14 +877,10 @@ async def websocket_handler(request: web.Request):
                 phone_w = data.get("screenWidth", 0)
                 phone_h = data.get("screenHeight", 0)
 
-                # Janela selecionada (modo window)
-                window_id = data.get("windowId", "")
-
                 # Cria a track de captura de tela
                 screen_track = ScreenCaptureTrack(
                     quality=quality, mode=requested_mode,
                     phone_w=phone_w, phone_h=phone_h,
-                    window_id=window_id,
                 )
                 pc.addTrack(relay.subscribe(screen_track))
 
