@@ -66,15 +66,19 @@ class WebRtcClient(
 
     private var pendingOfferQuality: String? = null
     private var pendingOfferMode: String = "mirror"
+    private var pendingScreenWidth: Int = 0
+    private var pendingScreenHeight: Int = 0
     private var requestedMode: String = "mirror"
 
     /** Cria a PeerConnection, gera a offer (recvonly de vídeo) e envia via sinalização.
      *  `mode` é "mirror" (duplicar a tela do PC) ou "extend" (pedir uma segunda
      *  tela de verdade — o PC pode não conseguir e cair pra "mirror" sozinho,
      *  ver [Listener.onModeResolved]). */
-    fun startConnection(quality: String, mode: String = "mirror") {
+    fun startConnection(quality: String, mode: String = "mirror", screenWidth: Int = 0, screenHeight: Int = 0) {
         pendingOfferQuality = quality
         pendingOfferMode = mode
+        pendingScreenWidth = screenWidth
+        pendingScreenHeight = screenHeight
         requestedMode = mode
 
         val rtcConfig = PeerConnection.RTCConfiguration(emptyList<PeerConnection.IceServer>()).apply {
@@ -131,6 +135,8 @@ class WebRtcClient(
                             sdpType = "offer",
                             quality = quality,
                             mode = pendingOfferMode,
+                            screenWidth = pendingScreenWidth,
+                            screenHeight = pendingScreenHeight,
                         )
                     }
                 }

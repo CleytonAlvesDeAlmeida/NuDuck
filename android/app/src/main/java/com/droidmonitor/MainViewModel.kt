@@ -1,6 +1,10 @@
 package com.droidmonitor
 
 import android.app.Application
+import android.content.Context
+import android.graphics.Point
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.droidmonitor.discovery.MdnsDiscovery
@@ -215,7 +219,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         signaling.listener = object : SignalingClient.Listener {
             override fun onPinAccepted() {
                 settingsRepository.savePin(pcKey(pc), pin)
-                rtc.startConnection(_uiState.value.quality, mode)
+                val screen = getRealScreenSize()
+                rtc.startConnection(_uiState.value.quality, mode, screen.first, screen.second)
             }
 
             override fun onPinRejected(blocked: Boolean) {
@@ -274,6 +279,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Exposto para a UI poder inicializar o SurfaceViewRenderer com o mesmo EglBase do cliente WebRTC. */
     val activeWebRtcClient: WebRtcClient?
         get() = webRtcClient
+
+    /** Retorna a resolução real da tela (incluindo barras do sistema). */
+    private fun getRealScreenSize(): Pair<Int, Int> {
+        val windowManager = getApplication<Application>()
+            .getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            if (windowManager != null) {
+                val display = windowManager.defaultDisplay
+                val point = Point()
+                display.getRealSize(point)
+                if (point.x > 0 && point.y > 0) {
+                    return Pair(point.x, point.y)
+                }
+            }
+        // Fallback: DisplayMetrics
+        val metrics = getApplication<Application>().resources.displayMetrics
+        return Pair(metrics.widthPixels, metrics.heightPixels)
+    }
 
     fun disconnect() {
         webRtcClient?.close()

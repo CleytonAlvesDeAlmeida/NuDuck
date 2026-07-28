@@ -763,11 +763,26 @@ def _xwd_to_bgr(data, expected_w, expected_h):
         valid_w = min(width, expected_w)
         valid_h = min(height, expected_h)
         img = raw[:valid_h, :valid_w * actual_bpp].reshape((valid_h, valid_w, actual_bpp))
-        img = img[:, :, :3].copy()
 
-        # Detecta ordem RGB vs BGR pelos masks
-        if red_mask > 0 and blue_mask > 0 and red_mask < blue_mask:
-            img = img[:, :, ::-1].copy()
+        # Para 32-bit: canais são [pad/alpha, R, G, B] (LSBFirst) ou
+        # [pad/alpha, R, G, B] (MSBFirst com BGRX).
+        # O canal 0 costuma ser padding/alpha, os dados de cor estão em 1:4.
+        if actual_bpp == 4:
+            img = img[:, :, 1:4].copy()
+        else:
+            img = img[:, :, :3].copy()
+
+        # Detecta ordem RGB vs BGR pelos masks.
+        # Xvfb em x86 (LSBFirst): bytes = [B, G, R] → já é BGR, sem flip.
+        # MSBFirst com masks típicos (R=0xFF0000, B=0x0000FF):
+        #   bytes = [R, G, B] → precisa flip para BGR.
+        # Quando red_mask > blue_mask (R em bits altos, B em bits baixos)
+        # e byte_order é MSBFirst, os dados estão em RGB.
+        if red_mask > 0 and blue_mask > 0 and red_mask > blue_mask:
+            # Lê byte_order do header (offset 28, CARD32)
+            byte_order = struct.unpack(">I", data[28:32])[0]
+            if byte_order == 0:  # MSBFirst = big-endian
+                img = img[:, :, ::-1].copy()
 
         return img
     except Exception as exc:

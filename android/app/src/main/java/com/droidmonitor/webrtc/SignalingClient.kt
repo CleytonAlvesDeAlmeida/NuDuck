@@ -108,13 +108,17 @@ class SignalingClient(
         })
     }
 
-    fun sendOffer(sdp: String, sdpType: String, quality: String, mode: String) {
+    fun sendOffer(sdp: String, sdpType: String, quality: String, mode: String, screenWidth: Int = 0, screenHeight: Int = 0) {
         send(JSONObject().apply {
             put("type", "offer")
             put("sdp", sdp)
             put("sdpType", sdpType)
             put("quality", quality)
             put("mode", mode)
+            if (screenWidth > 0 && screenHeight > 0) {
+                put("screenWidth", screenWidth)
+                put("screenHeight", screenHeight)
+            }
         })
     }
 

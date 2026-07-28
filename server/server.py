@@ -189,7 +189,8 @@ class ScreenCaptureTrack(VideoStreamTrack):
     _AUTO_LOAD_LOW = 0.4
     _AUTO_COOLDOWN_SECONDS = 2.5
 
-    def __init__(self, quality: str = DEFAULT_QUALITY, mode: str = "mirror"):
+    def __init__(self, quality: str = DEFAULT_QUALITY, mode: str = "mirror",
+                 phone_w: int = 0, phone_h: int = 0):
         super().__init__()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._sct = None
@@ -199,6 +200,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # Display virtual Xvfb (modo Estender)
         self._virtual_display = None
         self._virtual_display_info = None
+
+        # Dimensões da tela do celular (para adaptar o vídeo)
+        self._phone_w = phone_w if phone_w > 0 else None
+        self._phone_h = phone_h if phone_h > 0 else None
 
         self._frame_count = 0
         self._start_time = None
@@ -233,8 +238,14 @@ class ScreenCaptureTrack(VideoStreamTrack):
         stop_active_display()
 
         if is_xvfb_available():
-            log.info("Criando display virtual via Xvfb...")
-            vd = XvfbVirtualDisplay(width=1280, height=800)
+            # Usa resolução do celular se disponível, senão padrão 1280x800
+            vd_w = min(self._phone_w or 1280, 3840)
+            vd_h = min(self._phone_h or 800, 2160)
+            # Garante mínimo razoável
+            vd_w = max(vd_w, 320)
+            vd_h = max(vd_h, 240)
+            log.info("Criando display virtual via Xvfb (%dx%d)...", vd_w, vd_h)
+            vd = XvfbVirtualDisplay(width=vd_w, height=vd_h)
             success, result, info = vd.start()
             if success:
                 self._virtual_display = vd
@@ -359,6 +370,41 @@ class ScreenCaptureTrack(VideoStreamTrack):
         except Exception:
             pass
 
+    def _letterbox(self, pil_img):
+        """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
+        resolução do celular, sem cortar nenhuma parte da imagem.
+
+        Se as dimensões do celular não forem conhecidas, retorna a imagem
+        original sem alteração.
+        """
+        if not self._phone_w or not self._phone_h:
+            return pil_img
+
+        phone_w, phone_h = self._phone_w, self._phone_h
+        img_w, img_h = pil_img.size
+
+        # Se a imagem já tem o aspect ratio do celular, só redimensiona
+        if abs(img_w / img_h - phone_w / phone_h) < 0.02:
+            return pil_img.resize((phone_w, phone_h), Image.BILINEAR)
+
+        # Calcula escala para caber dentro da tela do celular
+        scale = min(phone_w / img_w, phone_h / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+
+        # Redimensiona mantendo proporção
+        resized = pil_img.resize((new_w, new_h), Image.BILINEAR)
+
+        # Cria canvas preto nas dimensões do celular
+        canvas = Image.new("RGB", (phone_w, phone_h), (0, 0, 0))
+
+        # Centraliza a imagem no canvas
+        x_offset = (phone_w - new_w) // 2
+        y_offset = (phone_h - new_h) // 2
+        canvas.paste(resized, (x_offset, y_offset))
+
+        return canvas
+
     def _resample_filter(self, target_h: int) -> int:
         """Filtro de reamostragem: NEAREST (mais leve) para as qualidades mais
         baixas, onde a perda de nitidez é imperceptível e a economia de CPU
@@ -409,6 +455,16 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 # Desenha cursor do mouse no display virtual (Xvfb não renderiza cursor)
                 self._draw_cursor_virtual(pil_img, src_w, src_h)
 
+                # Adaptar à resolução do celular se conhecida
+                if self._phone_w and self._phone_h:
+                    phone_w, phone_h = self._phone_w, self._phone_h
+                    # Alinha dimensões do celular a múltiplos de 16
+                    a_phone_w = max(16, round(phone_w / 16) * 16)
+                    a_phone_h = max(16, round(phone_h / 16) * 16)
+                    pil_img = self._letterbox(pil_img)
+                    # Redimensiona para as dimensões alinhadas
+                    pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
+
                 out = np.ascontiguousarray(np.array(pil_img))
                 return VideoFrame.from_ndarray(out, format="bgr24")
 
@@ -438,6 +494,14 @@ class ScreenCaptureTrack(VideoStreamTrack):
         pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))
 
         self._draw_cursor(pil_img)
+
+        # Adaptar à resolução do celular se conhecida
+        if self._phone_w and self._phone_h:
+            phone_w, phone_h = self._phone_w, self._phone_h
+            a_phone_w = max(16, round(phone_w / 16) * 16)
+            a_phone_h = max(16, round(phone_h / 16) * 16)
+            pil_img = self._letterbox(pil_img)
+            pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
 
         out = np.ascontiguousarray(np.array(pil_img))
         return VideoFrame.from_ndarray(out, format="bgr24")
@@ -619,8 +683,15 @@ async def websocket_handler(request: web.Request):
                 pc = RTCPeerConnection()
                 pcs.add(pc)
 
+                # Dimensões do celular (se enviadas pelo app)
+                phone_w = data.get("screenWidth", 0)
+                phone_h = data.get("screenHeight", 0)
+
                 # Cria a track de captura de tela
-                screen_track = ScreenCaptureTrack(quality=quality, mode=requested_mode)
+                screen_track = ScreenCaptureTrack(
+                    quality=quality, mode=requested_mode,
+                    phone_w=phone_w, phone_h=phone_h,
+                )
                 pc.addTrack(relay.subscribe(screen_track))
 
                 # DataChannel para controle remoto
