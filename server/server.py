@@ -9,6 +9,7 @@ Autenticação por PIN de 6 dígitos exibido na tela do PC.
 Modos:
   - Espelhar: o celular repete a tela do PC.
   - Estender: o celular vira uma segunda tela (usando Xvfb, igual SpaceDesk).
+  - Janela: o celular espelha apenas uma janela específica selecionada.
 
 Uso:
     python3 server.py
@@ -42,6 +43,7 @@ from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 from PIL import Image, ImageDraw
 from zeroconf import ServiceInfo, Zeroconf
+import cv2
 
 # Display virtual Xvfb (abordagem SpaceDesk para o modo Estender)
 from virtual_display import XvfbVirtualDisplay, is_xvfb_available, stop_active_display, set_active_display
@@ -109,6 +111,10 @@ class AppState:
     usb_status: str = "checking"
     failed_attempts: dict = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Modo espelhar janela: ID da janela selecionada (window_id do xdotool)
+    window_mode: bool = False
+    selected_window_id: Optional[int] = None
+    selected_window_name: str = ""
 
     def register_failed_attempt(self, ip: str) -> bool:
         """Retorna True se o IP acabou de ser bloqueado."""
@@ -172,16 +178,155 @@ async def local_network_only_middleware(request: web.Request, handler):
 
 
 # ==========================================================================
+# Listagem de janelas (para o modo Espelhar Janela)
+# ==========================================================================
+
+def get_window_list() -> list:
+    """Retorna lista de janelas abertas no display atual usando xdotool.
+
+    Cada item é um dict com:
+      - id: window ID (hex string)
+      - name: nome da janela (título)
+      - pid: PID do processo dono (se disponível)
+    """
+    if not shutil.which("xdotool"):
+        log.warning("xdotool não encontrado; não é possível listar janelas.")
+        return []
+
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--name", ""],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return []
+
+        window_ids = result.stdout.strip().splitlines()
+        windows = []
+        seen = set()
+
+        for wid_hex in window_ids:
+            wid_hex = wid_hex.strip()
+            if not wid_hex or wid_hex in seen:
+                continue
+            seen.add(wid_hex)
+
+            # Pega o nome da janela
+            try:
+                name_result = subprocess.run(
+                    ["xdotool", "getwindowname", wid_hex],
+                    capture_output=True, text=True, timeout=1,
+                )
+                name = name_result.stdout.strip() if name_result.returncode == 0 else "(sem nome)"
+            except Exception:
+                name = "(sem nome)"
+
+            # Ignora janelas sem nome útil
+            if not name or name in ("", "(sem nome)"):
+                continue
+
+            # Pega PID
+            pid = None
+            try:
+                pid_result = subprocess.run(
+                    ["xdotool", "getwindowpid", wid_hex],
+                    capture_output=True, text=True, timeout=1,
+                )
+                if pid_result.returncode == 0:
+                    pid = int(pid_result.stdout.strip())
+            except Exception:
+                pass
+
+            windows.append({
+                "id": wid_hex,
+                "name": name[:100],  # limita tamanho do nome
+                "pid": pid,
+            })
+
+        return windows
+
+    except Exception as exc:
+        log.warning("Erro ao listar janelas: %s", exc)
+        return []
+
+
+def capture_window(window_id_hex: str):
+    """Captura o conteúdo de uma janela específica usando xdotool + import.
+
+    Retorna numpy array BGR da janela, ou None se falhar.
+    Usa xdotool para pegar a geometria da janela e depois recorta
+    da captura completa da tela.
+    """
+    try:
+        # Pegar geometria da janela (x, y, largura, altura)
+        geo_result = subprocess.run(
+            ["xdotool", "getwindowgeometry", "--shell", window_id_hex],
+            capture_output=True, text=True, timeout=1,
+        )
+        if geo_result.returncode != 0:
+            return None
+
+        x = y = w = h = None
+        for line in geo_result.stdout.strip().splitlines():
+            line = line.strip()
+            if line.startswith("X="):
+                try: x = int(line.split("=")[1])
+                except: pass
+            elif line.startswith("Y="):
+                try: y = int(line.split("=")[1])
+                except: pass
+            elif line.startswith("WIDTH="):
+                try: w = int(line.split("=")[1])
+                except: pass
+            elif line.startswith("HEIGHT="):
+                try: h = int(line.split("=")[1])
+                except: pass
+
+        if x is None or y is None or w is None or h is None or w <= 0 or h <= 0:
+            return None
+
+        # Captura a tela completa e recorta a região da janela
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]  # monitor principal
+            raw = sct.grab(monitor)
+            screen = np.array(raw)[:, :, :3]  # BGRA -> BGR
+
+        # Coordenadas relativas ao monitor
+        rel_x = x - monitor["left"]
+        rel_y = y - monitor["top"]
+
+        # Garante que não sai dos limites da tela
+        rel_x = max(0, rel_x)
+        rel_y = max(0, rel_y)
+        max_x = min(rel_x + w, monitor["width"])
+        max_y = min(rel_y + h, monitor["height"])
+        w = max_x - rel_x
+        h = max_y - rel_y
+
+        if w <= 0 or h <= 0:
+            return None
+
+        # Recorta a região da janela
+        window_frame = screen[rel_y:rel_y + h, rel_x:rel_x + w]
+        return window_frame
+
+    except Exception as exc:
+        log.debug("Erro ao capturar janela %s: %s", window_id_hex, exc)
+        return None
+
+
+# ==========================================================================
 # Captura de tela -> VideoStreamTrack
 # ==========================================================================
 
 class ScreenCaptureTrack(VideoStreamTrack):
     """Captura a tela com mss e entrega frames pro WebRTC.
 
-    Dois modos:
+    Três modos:
       - "mirror": captura o monitor principal do PC e envia pro celular.
       - "extend": cria um display virtual via Xvfb e transmite ele.
         Funciona em qualquer hardware (igual ao SpaceDesk).
+      - "window": espelha apenas uma janela específica selecionada pelo usuário.
     """
 
     # Limites do ajuste automático de qualidade
@@ -190,7 +335,8 @@ class ScreenCaptureTrack(VideoStreamTrack):
     _AUTO_COOLDOWN_SECONDS = 2.5
 
     def __init__(self, quality: str = DEFAULT_QUALITY, mode: str = "mirror",
-                 phone_w: int = 0, phone_h: int = 0):
+                 phone_w: int = 0, phone_h: int = 0,
+                 window_id: str = ""):
         super().__init__()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._sct = None
@@ -200,6 +346,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # Display virtual Xvfb (modo Estender)
         self._virtual_display = None
         self._virtual_display_info = None
+
+        # Modo espelhar janela
+        self._window_id = window_id  # hex string do xdotool
 
         # Dimensões da tela do celular (para adaptar o vídeo)
         self._phone_w = phone_w if phone_w > 0 else None
@@ -215,7 +364,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._last_adapt = 0.0
 
         # Decide o modo
-        self.requested_mode = mode if mode in ("mirror", "extend") else "mirror"
+        self.requested_mode = mode if mode in ("mirror", "extend", "window") else "mirror"
         (
             self.resolved_mode,
             self._monitor_index,
@@ -230,6 +379,19 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
         Retorna (modo_real, índice_do_monitor, região, motivo_do_fallback).
         """
+        # --- Modo Espelhar Janela ---
+        if mode == "window":
+            if not self._window_id:
+                reason = "Nenhuma janela selecionada."
+                log.warning("Modo 'Janela' pedido, mas %s", reason)
+                return "mirror", 1, None, reason
+            if not shutil.which("xdotool"):
+                reason = "xdotool não encontrado. Instale: sudo apt install xdotool"
+                log.warning("Modo 'Janela' pedido, mas %s", reason)
+                return "mirror", 1, None, reason
+            log.info("Modo Espelhar Janela ativado (janela %s).", self._window_id)
+            return "window", 1, None, None
+
         if mode != "extend":
             return "mirror", 1, None, None
 
@@ -432,25 +594,38 @@ class ScreenCaptureTrack(VideoStreamTrack):
     def _capture_and_convert(self):
         """Captura a tela e converte para frame do WebRTC.
 
-        Nota de performance: a imagem circula internamente como BGR do
-        início ao fim (é assim que mss/Xvfb entregam e é assim que
-        VideoFrame.from_ndarray(..., format="bgr24") espera). Antes esse
-        método convertia pra RGB só pro PIL redimensionar e convertia de
-        volta pra BGR depois — dois "flips" de canais por frame que não
-        mudavam o resultado (redimensionar e desenhar o cursor branco/preto
-        não dependem da ordem R/G/B). Remover esses dois flips reduz o
-        trabalho de CPU por frame sem alterar a imagem final.
+        Três caminhos:
+          1. Xvfb (extend): pega frame do display virtual
+          2. Janela (window): captura apenas uma janela específica
+          3. Normal (mirror): captura monitor principal com mss
+
+        Nota BGR: mss/Xvfb/capture_window entregam BGR. PIL.Image.fromarray()
+        num array BGR cria uma imagem PIL com canais "BGR" — mas PIL sempre
+        interpreta como RGB. No entanto, ao passar de volta para numpy e
+        usar VideoFrame.from_ndarray(..., format="bgr24"), os canais são
+        interpretados como BGR. Então o ciclo BGR→PIL(BGR interpretado como
+        RGB)→numpy→bgr24 resulta em cores trocadas (R↔B).
+
+        Solução: Usar cv2.resize (opera em BGR nativamente) para o resize
+        inicial, e só converter para PIL para desenhar o cursor (operação
+        que não depende de cor). Depois volta para BGR numpy.
         """
 
-        # --- Caminho do display virtual Xvfb ---
+        # --- Caminho 1: Display virtual Xvfb (modo Estender) ---
         if self._virtual_display and self._virtual_display.is_running():
             frame_bgr = self._virtual_display.get_frame()
             if frame_bgr is not None:
                 src_h, src_w = frame_bgr.shape[:2]
                 target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-                pil_img = Image.fromarray(frame_bgr)
-                pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))
+                # Usa cv2.resize diretamente em BGR (sem conversão de canais)
+                frame_resized = cv2.resize(frame_bgr, (target_w, target_h),
+                                           interpolation=cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST)
+
+                # Converte para PIL apenas para desenhar o cursor
+                # cv2 BGR -> PIL RGB (cvtColor): B,G,R -> R,G,B
+                frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(frame_rgb)
 
                 # Desenha cursor do mouse no display virtual (Xvfb não renderiza cursor)
                 self._draw_cursor_virtual(pil_img, src_w, src_h)
@@ -458,15 +633,15 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 # Adaptar à resolução do celular se conhecida
                 if self._phone_w and self._phone_h:
                     phone_w, phone_h = self._phone_w, self._phone_h
-                    # Alinha dimensões do celular a múltiplos de 16
                     a_phone_w = max(16, round(phone_w / 16) * 16)
                     a_phone_h = max(16, round(phone_h / 16) * 16)
                     pil_img = self._letterbox(pil_img)
-                    # Redimensiona para as dimensões alinhadas
                     pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
 
-                out = np.ascontiguousarray(np.array(pil_img))
-                return VideoFrame.from_ndarray(out, format="bgr24")
+                # PIL RGB -> numpy RGB -> cv2 BGR para o VideoFrame
+                out_rgb = np.ascontiguousarray(np.array(pil_img))
+                out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+                return VideoFrame.from_ndarray(out_bgr, format="bgr24")
 
             # get_frame() retornou None (não deveria acontecer mais)
             log.warning("get_frame() retornou None, gerando frame de fallback")
@@ -476,7 +651,43 @@ class ScreenCaptureTrack(VideoStreamTrack):
             )
             return VideoFrame.from_ndarray(fallback, format="bgr24")
 
-        # --- Caminho normal: captura com mss (modo Espelhar) ---
+        # --- Caminho 2: Modo Espelhar Janela ---
+        if self.resolved_mode == "window" and self._window_id:
+            frame_bgr = capture_window(self._window_id)
+            if frame_bgr is not None and frame_bgr.size > 0:
+                src_h, src_w = frame_bgr.shape[:2]
+                target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
+
+                # Usa cv2.resize em BGR
+                frame_resized = cv2.resize(frame_bgr, (target_w, target_h),
+                                           interpolation=cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST)
+
+                # BGR -> RGB para PIL (cursor)
+                frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(frame_rgb)
+
+                # Adaptar à resolução do celular se conhecida
+                if self._phone_w and self._phone_h:
+                    phone_w, phone_h = self._phone_w, self._phone_h
+                    a_phone_w = max(16, round(phone_w / 16) * 16)
+                    a_phone_h = max(16, round(phone_h / 16) * 16)
+                    pil_img = self._letterbox(pil_img)
+                    pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
+
+                # PIL RGB -> BGR para VideoFrame
+                out_rgb = np.ascontiguousarray(np.array(pil_img))
+                out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+                return VideoFrame.from_ndarray(out_bgr, format="bgr24")
+
+            # Falha ao capturar janela — gera fallback com mensagem
+            log.debug("Falha ao capturar janela %s", self._window_id)
+            fallback = np.full(
+                (self._target_h, max(2, int(self._target_h * 16 / 9)), 3),
+                [46, 26, 26], dtype=np.uint8,
+            )
+            return VideoFrame.from_ndarray(fallback, format="bgr24")
+
+        # --- Caminho 3: Captura normal com mss (modo Espelhar) ---
         if self._sct is None:
             self._sct = mss.mss()
             if self._explicit_region is not None:
@@ -490,8 +701,13 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
         target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-        pil_img = Image.fromarray(img)
-        pil_img = pil_img.resize((target_w, target_h), self._resample_filter(target_h))
+        # Usa cv2.resize em BGR
+        frame_resized = cv2.resize(img, (target_w, target_h),
+                                    interpolation=cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST)
+
+        # BGR -> RGB para PIL (cursor)
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame_rgb)
 
         self._draw_cursor(pil_img)
 
@@ -503,8 +719,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
             pil_img = self._letterbox(pil_img)
             pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
 
-        out = np.ascontiguousarray(np.array(pil_img))
-        return VideoFrame.from_ndarray(out, format="bgr24")
+        # PIL RGB -> BGR para VideoFrame
+        out_rgb = np.ascontiguousarray(np.array(pil_img))
+        out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+        return VideoFrame.from_ndarray(out_bgr, format="bgr24")
 
     async def recv(self):
         if self._start_time is None:
@@ -677,7 +895,7 @@ async def websocket_handler(request: web.Request):
                 STATE.quality = quality
 
                 requested_mode = data.get("mode", "mirror")
-                if requested_mode not in ("mirror", "extend"):
+                if requested_mode not in ("mirror", "extend", "window"):
                     requested_mode = "mirror"
 
                 pc = RTCPeerConnection()
@@ -687,10 +905,14 @@ async def websocket_handler(request: web.Request):
                 phone_w = data.get("screenWidth", 0)
                 phone_h = data.get("screenHeight", 0)
 
+                # Janela selecionada (modo window)
+                window_id = data.get("windowId", "")
+
                 # Cria a track de captura de tela
                 screen_track = ScreenCaptureTrack(
                     quality=quality, mode=requested_mode,
                     phone_w=phone_w, phone_h=phone_h,
+                    window_id=window_id,
                 )
                 pc.addTrack(relay.subscribe(screen_track))
 
@@ -771,6 +993,16 @@ async def status_handler(request: web.Request):
         "allow_control": STATE.allow_control,
         "quality": STATE.quality,
     })
+
+
+async def windows_handler(request: web.Request):
+    """Endpoint REST que lista todas as janelas abertas no display.
+
+    GET /windows -> JSON com lista de janelas [{id, name, pid}, ...]
+    Usado pelo app Android e pela UI Tkinter para mostrar as opções.
+    """
+    windows = get_window_list()
+    return web.json_response({"windows": windows})
 
 
 # ==========================================================================
@@ -902,6 +1134,7 @@ def start_ui(hostname: str):
     """Janela Tkinter com o PIN, QR Code e controles."""
     import sys
     import tkinter as tk
+    from tkinter import ttk
 
     def _icon_path() -> str:
         base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
@@ -943,7 +1176,7 @@ def start_ui(hostname: str):
         def sc(px: int) -> int:
             return int(round(px * ui_scale))
 
-        base_w, base_h = 340, 620
+        base_w, base_h = 340, 820
         win_w = min(sc(base_w), int(root.winfo_screenwidth() * 0.9))
         win_h = min(sc(base_h), int(root.winfo_screenheight() * 0.9))
         pos_x = max(0, (root.winfo_screenwidth() - win_w) // 2)
@@ -1037,6 +1270,91 @@ def start_ui(hostname: str):
             variable=control_var, command=on_toggle,
         ).pack(pady=5)
 
+        # --- Seção: Seleção de janela para espelhar ---
+        window_frame = tk.LabelFrame(
+            root, text=" Espelhar Janela ", font=("Sans", 10, "bold"),
+            padx=8, pady=5,
+        )
+        window_frame.pack(fill="x", padx=15, pady=(8, 0))
+
+        window_var = tk.StringVar(value="")
+
+        window_combo = ttk.Combobox(
+            window_frame, textvariable=window_var,
+            state="readonly", width=40,
+        )
+        window_combo.pack(fill="x", pady=(2, 4))
+
+        window_status_label = tk.Label(
+            window_frame, text="Clique em 'Atualizar' para ver as janelas",
+            font=("Sans", 8), fg="gray",
+        )
+        window_status_label.pack()
+
+        def refresh_windows():
+            """Busca janelas abertas e atualiza o combobox."""
+            windows = get_window_list()
+            if not windows:
+                window_status_label.config(
+                    text="Nenhuma janela encontrada (xdotool necessário)",
+                    fg="orange",
+                )
+                window_combo["values"] = []
+                window_var.set("")
+                STATE.window_mode = False
+                STATE.selected_window_id = None
+                STATE.selected_window_name = ""
+                return
+
+            names = [f"{w['name']} (PID:{w['pid'] or '?'})" for w in windows]
+            window_combo["values"] = names
+            window_status_label.config(
+                text=f"{len(windows)} janela(s) encontrada(s)",
+                fg="#2e7d32",
+            )
+
+            # Guarda mapeamento nome -> window id para uso ao selecionar
+            window_frame._window_map = {
+                f"{w['name']} (PID:{w['pid'] or '?'})": w
+                for w in windows
+            }
+
+            # Se já tinha uma janela selecionada, re-seleciona
+            if STATE.selected_window_name:
+                for n in names:
+                    if STATE.selected_window_name in n:
+                        window_var.set(n)
+                        break
+
+        def on_window_selected(event=None):
+            """Quando o usuário seleciona uma janela no combobox."""
+            sel = window_var.get()
+            wmap = getattr(window_frame, "_window_map", {})
+            win = wmap.get(sel)
+            if win:
+                STATE.window_mode = True
+                STATE.selected_window_id = win["id"]
+                STATE.selected_window_name = win["name"]
+                window_status_label.config(
+                    text=f"Janela selecionada: {win['name']}",
+                    fg="#1565c0",
+                )
+                log.info("Janela selecionada: %s (ID: %s)", win["name"], win["id"])
+            else:
+                STATE.window_mode = False
+                STATE.selected_window_id = None
+                STATE.selected_window_name = ""
+
+        window_combo.bind("<<ComboboxSelected>>", on_window_selected)
+
+        refresh_btn = tk.Button(
+            window_frame, text="Atualizar janelas",
+            command=refresh_windows, font=("Sans", 9),
+        )
+        refresh_btn.pack(pady=(2, 0))
+
+        window_frame._window_map = {}
+
         usb_label = tk.Label(root, text="Cabo USB: verificando...", fg="gray", font=("Sans", 9))
         usb_label.pack(pady=(8, 0))
 
@@ -1078,6 +1396,7 @@ def build_app() -> web.Application:
     app = web.Application(middlewares=[local_network_only_middleware])
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("/status", status_handler)
+    app.router.add_get("/windows", windows_handler)
     app.on_shutdown.append(on_shutdown)
     return app
 
