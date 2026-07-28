@@ -5,7 +5,12 @@ Funciona igual ao SpaceDesk: cria um servidor X separado (Xvfb) que o
 celular renderiza e controla, funcionando como uma segunda tela virtual.
 
 Requisitos:
-  sudo apt install xvfb xdotool openbox xsetroot x11-utils xterm
+  sudo apt install xvfb xdotool openbox x11-xserver-utils x11-apps xterm
+
+Nota: pacotes chamados "xsetroot" ou "x11-utils" NÃO existem no apt para
+esse fim (xsetroot vem dentro de x11-xserver-utils, e xwd vem dentro de
+x11-apps, não de x11-utils). Colocar um nome errado no comando de
+instalação faz o apt cancelar a instalação inteira.
 """
 
 import logging
@@ -17,6 +22,11 @@ import struct
 import subprocess
 import threading
 import time
+
+try:
+    import mss
+except ImportError:
+    mss = None
 
 log = logging.getLogger("NuDuck")
 
@@ -64,6 +74,7 @@ class XvfbVirtualDisplay:
         self._started = False
         self._wm_name = None
         self._capture_ok = False
+        self._mss_instance = None
 
     def start(self):
         """Inicia o Xvfb + window manager + captura.
@@ -331,8 +342,24 @@ root.mainloop()
 
         # ===== FASE 1: Encontrar método de captura que funciona =====
 
-        # Método 1: xwd (X Window Dump)
-        if shutil.which("xwd"):
+        # Método 0 (preferido): mss — captura em processo, sem abrir um
+        # programa novo a cada frame. É a mesma biblioteca já usada no modo
+        # Espelhar, só que apontando pro display virtual (:N) em vez do
+        # display real. É de longe o método mais rápido e mais leve de CPU:
+        # xwd/import abrem um processo do zero (fork+exec) a cada frame, o
+        # que é caro (~5-20ms só de overhead) e pesa bastante em PCs mais
+        # fracos quando repetido ~30x por segundo.
+        if capture_fn is None and mss is not None:
+            log.info("Testando captura via mss em %s...", display_name)
+            fn = self._test_mss(display_name)
+            if fn is not None:
+                capture_fn = fn
+                log.info("Captura via mss OK em %s (método rápido)", display_name)
+            else:
+                log.warning("mss falhou em %s, tentando outro método", display_name)
+
+        # Método 1: xwd (X Window Dump) — só testa se mss não funcionou
+        if capture_fn is None and shutil.which("xwd"):
             log.info("Testando captura via xwd em %s...", display_name)
             fn = self._test_xwd(display_name)
             if fn is not None:
@@ -373,6 +400,66 @@ root.mainloop()
                 if _fail_count[0] == MAX_FAIL:
                     log.error("Captura falhou %dx consecutivas!", MAX_FAIL)
             self._stop_event.wait(0.033)  # ~30fps
+
+    def _test_mss(self, display_name):
+        """Testa captura via mss (biblioteca já usada no modo Espelhar).
+
+        Conecta uma única vez ao display virtual e reaproveita a conexão
+        a cada frame — nada de abrir processo novo. Retorna a função de
+        captura rápida, ou None se não conseguir conectar/capturar.
+        """
+        try:
+            sct = mss.mss(display=display_name)
+        except Exception as exc:
+            log.warning("mss: não conseguiu conectar em %s: %s", display_name, exc)
+            return None
+
+        try:
+            monitor = sct.monitors[0] if sct.monitors else {
+                "left": 0, "top": 0, "width": self.width, "height": self.height,
+            }
+            raw = sct.grab(monitor)
+            img = np.array(raw)[:, :, :3]  # BGRA -> BGR
+        except Exception as exc:
+            log.warning("mss: captura de teste falhou em %s: %s", display_name, exc)
+            try:
+                sct.close()
+            except Exception:
+                pass
+            return None
+
+        if img is None or img.shape[0] < 10 or img.shape[1] < 10:
+            log.warning("mss: frame de teste inválido em %s", display_name)
+            try:
+                sct.close()
+            except Exception:
+                pass
+            return None
+
+        log.info("mss OK — frame %dx%d", img.shape[1], img.shape[0])
+        self._mss_instance = sct
+
+        with self._frame_lock:
+            if img.shape[:2] == (self.height, self.width):
+                np.copyto(self._latest_frame, img)
+            else:
+                self._latest_frame = np.ascontiguousarray(img)
+        self._new_frame_event.set()
+
+        def capture_mss():
+            try:
+                raw = sct.grab(monitor)
+                arr = np.array(raw)[:, :, :3]
+                with self._frame_lock:
+                    if arr.shape[:2] == (self.height, self.width):
+                        np.copyto(self._latest_frame, arr)
+                    else:
+                        self._latest_frame = np.ascontiguousarray(arr)
+                self._new_frame_event.set()
+            except Exception:
+                pass
+
+        return capture_mss
 
     def _test_xwd(self, display_name):
         """Testa se xwd funciona. Retorna função de captura ou None."""
@@ -539,6 +626,14 @@ root.mainloop()
             self._capture_thread.join(timeout=3)
         self._capture_thread = None
 
+        # Fecha conexão mss (se estava sendo usada pra captura)
+        if self._mss_instance is not None:
+            try:
+                self._mss_instance.close()
+            except Exception:
+                pass
+            self._mss_instance = None
+
         # Mata WM
         if self.wm_process:
             try:
@@ -674,13 +769,19 @@ root.mainloop()
                     env=env, capture_output=True, timeout=1,
                 )
             elif action == "mousedown":
+                # Move pro ponto do toque ANTES de apertar o botão — sem isso
+                # o clique inicial de um arrastar/rolar acontecia onde o mouse
+                # já estava (posição de um toque anterior), não onde o dedo
+                # realmente tocou a tela.
                 subprocess.run(
-                    ["xdotool", "mousedown", "1"],
+                    ["xdotool", "mousemove", "--", str(int(x)), str(int(y)),
+                     "mousedown", "1"],
                     env=env, capture_output=True, timeout=1,
                 )
             elif action == "mouseup":
                 subprocess.run(
-                    ["xdotool", "mouseup", "1"],
+                    ["xdotool", "mousemove", "--", str(int(x)), str(int(y)),
+                     "mouseup", "1"],
                     env=env, capture_output=True, timeout=1,
                 )
             elif action == "key" and key:

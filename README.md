@@ -26,19 +26,27 @@ NuDuck/
 
 ```bash
 # Debian/Ubuntu
-sudo apt install python3-tk xvfb xdotool openbox x11-xserver-utils xsetroot
+sudo apt install python3-tk xvfb xdotool openbox x11-xserver-utils x11-apps xterm
 
 # Fedora
-sudo dnf install python3-tkinter xorg-x11-server-Xvfb xdotool openbox xorg-x11-server-utils xsetroot
+sudo dnf install python3-tkinter xorg-x11-server-Xvfb xdotool openbox xorg-x11-server-utils xorg-x11-apps xterm
 ```
+
+> ⚠️ **Atenção:** versões antigas deste README listavam um pacote chamado `xsetroot`,
+> que **não existe** no apt/dnf (o comando `xsetroot` vem de dentro do pacote
+> `x11-xserver-utils`, que já está na lista acima). Colocar um nome de pacote
+> inválido no meio do comando faz o `apt`/`dnf` **cancelar a instalação inteira**,
+> ou seja, nem o Xvfb era instalado — e por isso o modo Estender caía sempre
+> no aviso "Xvfb não encontrado". Use o comando corrigido acima.
 
 > O que cada pacote faz:
 > - `python3-tk` — janela com o PIN e QR Code
 > - `xvfb` — display virtual (modo Estender)
 > - `xdotool` — envia cliques pro display virtual
 > - `openbox` — window manager pro display virtual
-> - `xsetroot` — cor de fundo do desktop virtual
-> - `x11-xserver-utils` — ferramentas X11
+> - `x11-xserver-utils` — fornece o `xsetroot` (cor de fundo do desktop virtual)
+> - `x11-apps` — fornece o `xwd` (captura de tela de reserva, caso a captura rápida falhe)
+> - `xterm` — terminal que abre automaticamente na tela virtual
 
 ### 2. Dependências Python
 

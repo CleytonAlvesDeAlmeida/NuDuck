@@ -409,9 +409,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # Xvfb não instalado
         reason = (
             "Xvfb não encontrado. Instale com:\n"
-            "  sudo apt install xvfb xdotool openbox\n"
+            "  sudo apt install xvfb xdotool openbox x11-xserver-utils x11-apps xterm\n"
             "(Debian/Ubuntu) ou:\n"
-            "  sudo dnf install xorg-x11-server-Xvfb xdotool openbox\n"
+            "  sudo dnf install xorg-x11-server-Xvfb xdotool openbox xorg-x11-server-utils xorg-x11-apps xterm\n"
             "(Fedora)"
         )
         log.warning("Modo 'Estender' pedido, mas %s", reason)
