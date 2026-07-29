@@ -1380,7 +1380,7 @@ def start_ui(hostname: str):
                 "name": hostname,
                 "pin": STATE.pin,
             })
-            box_size = max(3, round(5 * ui_scale))
+            box_size = max(3, round(4 * ui_scale))
             qr_img = qrcode.make(payload, box_size=box_size, border=2)
             return ImageTk.PhotoImage(qr_img, master=root)
         except Exception as exc:
@@ -1423,13 +1423,13 @@ def start_ui(hostname: str):
         # Janela mais baixa que antes — o conteúdo agora fica em abas em
         # vez de tudo empilhado numa coluna só (por isso 980px de altura
         # não é mais necessário).
-        base_w, base_h = 360, 700
+        base_w, base_h = 380, 820
         win_w = min(sc(base_w), int(root.winfo_screenwidth() * 0.9))
         win_h = min(sc(base_h), int(root.winfo_screenheight() * 0.9))
         pos_x = max(0, (root.winfo_screenwidth() - win_w) // 2)
         pos_y = max(0, (root.winfo_screenheight() - win_h) // 3)
         root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-        root.minsize(sc(300), sc(480))
+        root.minsize(sc(300), sc(560))
         root.resizable(True, True)
 
         # ---- Estilo ttk (Notebook/Combobox não têm equivalente puro em tk) ----
@@ -1537,31 +1537,31 @@ def start_ui(hostname: str):
         header.pack(fill="x")
 
         tk.Label(
-            header, text=APP_NAME, font=("Sans", 17, "bold"),
+            header, text=APP_NAME, font=("Sans", 16, "bold"),
             bg=BG_SURFACE, fg=ACCENT_BLUE,
-        ).pack(pady=(14, 2))
+        ).pack(pady=(10, 1))
         tk.Label(
-            header, text="PIN de conexão", font=("Sans", 10),
+            header, text="PIN de conexão", font=("Sans", 9),
             bg=BG_SURFACE, fg=FG_MUTED,
         ).pack()
         tk.Label(
-            header, text=STATE.pin, font=("Consolas", 30, "bold"),
+            header, text=STATE.pin, font=("Consolas", 26, "bold"),
             bg=BG_SURFACE, fg=ACCENT_ORANGE,
-        ).pack(pady=(0, 8))
+        ).pack(pady=(0, 4))
 
         qr_photo = _build_qr_photo(root, ui_scale)
         if qr_photo is not None:
-            qr_wrap = tk.Frame(header, bg="white", padx=6, pady=6)
-            qr_wrap.pack(pady=(0, 6))
+            qr_wrap = tk.Frame(header, bg="white", padx=4, pady=4)
+            qr_wrap.pack(pady=(0, 4))
             qr_label = tk.Label(qr_wrap, image=qr_photo, bg="white")
             qr_label.image = qr_photo
             qr_label.pack()
             tk.Label(
                 header, text="Escaneie no app para conectar",
-                font=("Sans", 9), bg=BG_SURFACE, fg=FG_MUTED,
-            ).pack(pady=(0, 12))
+                font=("Sans", 8), bg=BG_SURFACE, fg=FG_MUTED,
+            ).pack(pady=(0, 8))
         else:
-            tk.Frame(header, bg=BG_SURFACE, height=8).pack()
+            tk.Frame(header, bg=BG_SURFACE, height=6).pack()
 
         control_var = tk.BooleanVar(value=STATE.allow_control)
 
@@ -1581,12 +1581,60 @@ def start_ui(hostname: str):
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, padx=10, pady=(2, 6))
 
-        tab_window = tk.Frame(notebook, bg=BG_CARD, padx=14, pady=14)
-        tab_shortcuts = tk.Frame(notebook, bg=BG_CARD, padx=14, pady=14)
-        tab_system = tk.Frame(notebook, bg=BG_CARD, padx=14, pady=14)
-        notebook.add(tab_window, text="  Janela  ")
-        notebook.add(tab_shortcuts, text="  Atalhos  ")
-        notebook.add(tab_system, text="  Sistema  ")
+        def _make_scrollable_tab(bg):
+            """Cria uma aba com rolagem vertical, pra garantir que os campos
+            e botões nunca fiquem escondidos fora da área visível da janela
+            — não importa o tamanho da tela nem quantos itens tenham dentro.
+            """
+            outer = tk.Frame(notebook, bg=bg)
+            canvas = tk.Canvas(outer, bg=bg, highlightthickness=0, borderwidth=0)
+            vsb = tk.Scrollbar(
+                outer, orient="vertical", command=canvas.yview,
+                bg=ACCENT_BLUE_DK, troughcolor=BG_SURFACE,
+                activebackground=ACCENT_BLUE, borderwidth=0,
+                highlightthickness=0, width=12,
+            )
+            inner = tk.Frame(canvas, bg=bg, padx=14, pady=14)
+            inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+            canvas.configure(yscrollcommand=vsb.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            # Sempre visível (não só quando "precisa") — versão anterior
+            # escondia a barra baseada na altura do canvas medida cedo
+            # demais, o que podia deixá-la escondida por engano mesmo com
+            # conteúdo cortado, escondendo caixas de texto e botões.
+            vsb.pack(side="right", fill="y")
+
+            def _on_inner_configure(_event=None):
+                canvas.configure(scrollregion=canvas.bbox("all"))
+
+            inner.bind("<Configure>", _on_inner_configure)
+            canvas.bind("<Configure>", lambda e: (canvas.itemconfig(inner_id, width=e.width), _on_inner_configure()))
+
+            def _wheel(event):
+                delta = event.delta
+                if delta:
+                    canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+            def _bind_wheel(_e=None):
+                canvas.bind_all("<MouseWheel>", _wheel)
+                canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-2, "units"))
+                canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(2, "units"))
+
+            def _unbind_wheel(_e=None):
+                canvas.unbind_all("<MouseWheel>")
+                canvas.unbind_all("<Button-4>")
+                canvas.unbind_all("<Button-5>")
+
+            outer.bind("<Enter>", _bind_wheel)
+            outer.bind("<Leave>", _unbind_wheel)
+            return outer, inner
+
+        tab_window_outer, tab_window = _make_scrollable_tab(BG_CARD)
+        tab_shortcuts_outer, tab_shortcuts = _make_scrollable_tab(BG_CARD)
+        tab_system_outer, tab_system = _make_scrollable_tab(BG_CARD)
+        notebook.add(tab_window_outer, text="  Janela  ")
+        notebook.add(tab_shortcuts_outer, text="  Atalhos  ")
+        notebook.add(tab_system_outer, text="  Sistema  ")
 
         def _section_label(parent, text):
             tk.Label(
@@ -1702,7 +1750,11 @@ def start_ui(hostname: str):
             bg=BG_FIELD, fg=FG_TEXT, selectbackground=ACCENT_BLUE,
             selectforeground="#00202B", borderwidth=0, highlightthickness=0,
         )
-        shortcut_scrollbar = tk.Scrollbar(shortcut_listbox_frame, orient="vertical", command=shortcut_listbox.yview)
+        shortcut_scrollbar = tk.Scrollbar(
+            shortcut_listbox_frame, orient="vertical", command=shortcut_listbox.yview,
+            bg=BG_CARD, troughcolor=BG_FIELD, activebackground=ACCENT_BLUE_DK,
+            borderwidth=0, highlightthickness=0, width=10,
+        )
         shortcut_listbox.configure(yscrollcommand=shortcut_scrollbar.set)
         shortcut_listbox.pack(side="left", fill="both", expand=True)
         shortcut_scrollbar.pack(side="right", fill="y")
