@@ -68,6 +68,14 @@
     <string name="menu_disconnect">Disconnect</string>
     <string name="menu_back">Back</string>
     <string name="menu_quality_selected_cd">Selected quality</string>
+    <string name="menu_mode">Mode</string>
+    <string name="menu_mode_mirror">Mirror</string>
+    <string name="menu_mode_extend">Extend</string>
+    <string name="menu_mode_mirror_desc">Repeats the PC screen</string>
+    <string name="menu_mode_extend_desc">Virtual second screen</string>
+    <string name="menu_shortcuts">Shortcuts</string>
+    <string name="menu_shortcuts_empty">No shortcuts defined on the server</string>
+    <string name="menu_shortcuts_loading">Loading shortcuts…</string>
 
     <!-- QR Code scanning -->
     <string name="qr_scan_hint">Point the camera at the QR Code shown on the PC</string>

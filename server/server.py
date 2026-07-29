@@ -46,7 +46,33 @@ from zeroconf import ServiceInfo, Zeroconf
 import cv2
 
 # Display virtual Xvfb (abordagem SpaceDesk para o modo Estender)
-from virtual_display import XvfbVirtualDisplay, is_xvfb_available, stop_active_display, set_active_display
+from virtual_display import XvfbVirtualDisplay, is_xvfb_available, stop_active_display, set_active_display, get_active_display
+import json as _json
+
+# ==========================================================================
+# Atalhos do servidor (salvos em shortcuts.json)
+# ==========================================================================
+
+SHORTCUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortcuts.json")
+
+
+def _load_shortcuts() -> list:
+    """Carrega a lista de atalhos do arquivo JSON."""
+    try:
+        with open(SHORTCUTS_FILE, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+            return data.get("shortcuts", [])
+    except Exception:
+        return []
+
+
+def _save_shortcuts(shortcuts: list):
+    """Salva a lista de atalhos no arquivo JSON."""
+    try:
+        with open(SHORTCUTS_FILE, "w", encoding="utf-8") as f:
+            _json.dump({"shortcuts": shortcuts}, f, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        log.error("Erro ao salvar atalhos: %s", exc)
 
 
 # ==========================================================================
@@ -115,6 +141,14 @@ class AppState:
     window_mode: bool = False
     selected_window_id: Optional[int] = None
     selected_window_name: str = ""
+    # Modo atual da conexão ativa
+    current_mode: str = "mirror"
+    # Referência ao screen_track ativo (para mode_change e resize)
+    active_screen_track: Optional[object] = None
+    # Referência à PC ativa (para renegociação)
+    active_pc: Optional[object] = None
+    # Função de envio WebSocket ativa (para respostas de mode_change/resize)
+    active_ws_send: Optional[object] = None
 
     def register_failed_attempt(self, ip: str) -> bool:
         """Retorna True se o IP acabou de ser bloqueado."""
@@ -941,6 +975,93 @@ async def websocket_handler(request: web.Request):
                     STATE.quality = q
                     log.info("Qualidade alterada: %s", q)
 
+            # Mudança de modo (Espelhar <-> Estender) durante conexão ativa
+            elif mtype == "mode_change" and screen_track is not None:
+                new_mode = data.get("mode", "mirror")
+                if new_mode not in ("mirror", "extend"):
+                    new_mode = "mirror"
+                current = screen_track.resolved_mode
+                if new_mode != current:
+                    log.info("Pedido de mudança de modo: %s -> %s", current, new_mode)
+                    # Recria o ScreenCaptureTrack com o novo modo
+                    phone_w = screen_track._phone_w or 0
+                    phone_h = screen_track._phone_h or 0
+                    old_track = screen_track
+                    new_track = ScreenCaptureTrack(
+                        quality=STATE.quality,
+                        mode=new_mode,
+                        phone_w=phone_w,
+                        phone_h=phone_h,
+                    )
+                    STATE.active_screen_track = new_track
+                    STATE.current_mode = new_track.resolved_mode
+                    # Para o track antigo (fecha Xvfb se estava em extend)
+                    old_track.close()
+                    # Substitui no relay e na PeerConnection
+                    if pc is not None:
+                        sender = pc.getSenders()[0] if pc.getSenders() else None
+                        if sender:
+                            try:
+                                sender.replaceTrack(relay.subscribe(new_track))
+                                log.info("Track substituída: modo %s -> %s", current, new_track.resolved_mode)
+                            except Exception as exc:
+                                log.warning("Falha ao substituir track: %s", exc)
+                    # Responde com o modo real resolvido
+                    await ws.send_json({
+                        "type": "mode_changed",
+                        "mode": new_track.resolved_mode,
+                        "modeFallbackReason": new_track.fallback_reason,
+                    })
+
+            # Redimensionamento do Xvfb (rotação do celular)
+            elif mtype == "resize" and screen_track is not None:
+                new_w = int(data.get("width", 0))
+                new_h = int(data.get("height", 0))
+                if new_w > 0 and new_h > 0:
+                    log.info("Pedido de redimensionamento: %dx%d", new_w, new_h)
+                    vd = screen_track._virtual_display
+                    if vd and vd.is_running():
+                        # Redimensiona o Xvfb
+                        old_w, old_h = vd.width, vd.height
+                        if old_w != new_w or old_h != new_h:
+                            success = vd.resize(new_w, new_h)
+                            if success:
+                                screen_track._phone_w = new_w
+                                screen_track._phone_h = new_h
+                                log.info("Xvfb redimensionado: %dx%d -> %dx%d", old_w, old_h, new_w, new_h)
+                                await ws.send_json({
+                                    "type": "resize_ok",
+                                    "width": new_w,
+                                    "height": new_h,
+                                })
+                            else:
+                                log.warning("Falha ao redimensionar Xvfb")
+                                await ws.send_json({
+                                    "type": "resize_error",
+                                    "message": "Falha ao redimensionar Xvfb",
+                                })
+                        else:
+                            # Mesma resolução, apenas atualiza
+                            screen_track._phone_w = new_w
+                            screen_track._phone_h = new_h
+                    else:
+                        # Não está em modo extend, apenas atualiza dimensões do celular
+                        screen_track._phone_w = new_w
+                        screen_track._phone_h = new_h
+                        log.info("Dimensões do celular atualizadas: %dx%d (modo %s)", new_w, new_h, screen_track.resolved_mode)
+
+            # Execução de atalho via WebSocket
+            elif mtype == "execute_shortcut":
+                shortcut_name = str(data.get("name", "")).strip()
+                if shortcut_name:
+                    shortcuts = _load_shortcuts()
+                    shortcut = next((s for s in shortcuts if s["name"] == shortcut_name), None)
+                    if shortcut:
+                        _execute_shortcut_command(shortcut["command"])
+                        log.info("Atalho executado (via WS): %s", shortcut_name)
+                    else:
+                        log.warning("Atalho não encontrado (via WS): %s", shortcut_name)
+
     except Exception as exc:
         log.exception("Erro na sessão de %s: %s", peer_ip, exc)
     finally:
@@ -960,6 +1081,7 @@ async def status_handler(request: web.Request):
         "name": APP_NAME,
         "allow_control": STATE.allow_control,
         "quality": STATE.quality,
+        "current_mode": STATE.current_mode,
     })
 
 
@@ -971,6 +1093,109 @@ async def windows_handler(request: web.Request):
     """
     windows = get_window_list()
     return web.json_response({"windows": windows})
+
+
+# ==========================================================================
+# Atalhos (REST + execução)
+# ==========================================================================
+
+async def shortcuts_handler(request: web.Request):
+    """Endpoint REST para gerenciar atalhos.
+
+    GET /shortcuts  -> lista de {name, command} (usado pelo app Android).
+    POST /shortcuts -> adiciona um atalho (usado pelo servidor/UI).
+    DELETE /shortcuts -> remove um atalho por nome (query: ?name=...).
+    POST /shortcuts/execute -> executa um atalho no displaydigital.
+    """
+    if request.method == "GET":
+        shortcuts = _load_shortcuts()
+        # Retorna só os nomes (o app mostra os nomes, não os comandos)
+        return web.json_response({"shortcuts": [{"name": s["name"]} for s in shortcuts]})
+
+    elif request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "JSON inválido"}, status=400)
+
+        name = str(data.get("name", "")).strip()
+        command = str(data.get("command", "")).strip()
+        if not name or not command:
+            return web.json_response({"error": "'name' e 'command' são obrigatórios"}, status=400)
+
+        shortcuts = _load_shortcuts()
+        # Atualiza se já existe, ou adiciona novo
+        existing = next((i for i, s in enumerate(shortcuts) if s["name"] == name), None)
+        if existing is not None:
+            shortcuts[existing]["command"] = command
+        else:
+            shortcuts.append({"name": name, "command": command})
+        _save_shortcuts(shortcuts)
+        log.info("Atalho salvo: %s", name)
+        return web.json_response({"ok": True, "shortcuts": [{"name": s["name"]} for s in shortcuts]})
+
+    elif request.method == "DELETE":
+        name = request.query.get("name", "").strip()
+        if not name:
+            return web.json_response({"error": "?name= é obrigatório"}, status=400)
+
+        shortcuts = _load_shortcuts()
+        new_shortcuts = [s for s in shortcuts if s["name"] != name]
+        if len(new_shortcuts) == len(shortcuts):
+            return web.json_response({"error": "Atalho não encontrado"}, status=404)
+        _save_shortcuts(new_shortcuts)
+        log.info("Atalho removido: %s", name)
+        return web.json_response({"ok": True, "shortcuts": [{"name": s["name"]} for s in new_shortcuts]})
+
+    return web.json_response({"error": "Método não permitido"}, status=405)
+
+
+async def shortcuts_execute_handler(request: web.Request):
+    """Executa um atalho no displaydigital (segunda tela Xvfb).
+
+    POST /shortcuts/execute  body: {"name": "..."}
+    O comando é executado no DISPLAY do Xvfb ativo.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "JSON inválido"}, status=400)
+
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return web.json_response({"error": "'name' é obrigatório"}, status=400)
+
+    shortcuts = _load_shortcuts()
+    shortcut = next((s for s in shortcuts if s["name"] == name), None)
+    if shortcut is None:
+        return web.json_response({"error": f"Atalho '{name}' não encontrado"}, status=404)
+
+    command = shortcut["command"]
+    _execute_shortcut_command(command)
+    return web.json_response({"ok": True, "executed": name})
+
+
+def _execute_shortcut_command(command: str):
+    """Executa um comando no displaydigital (Xvfb ativo)."""
+    vd = get_active_display()
+    env = None
+    if vd and vd.is_running() and vd.display_name:
+        env = {**os.environ, "DISPLAY": vd.display_name}
+        log.info("Executando atalho no %s: %s", vd.display_name, command)
+    else:
+        log.info("Executando atalho no display principal: %s", command)
+
+    try:
+        subprocess.Popen(
+            command,
+            shell=True,
+            env=env or os.environ,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        log.error("Erro ao executar atalho: %s", exc)
 
 
 # ==========================================================================
@@ -1144,7 +1369,7 @@ def start_ui(hostname: str):
         def sc(px: int) -> int:
             return int(round(px * ui_scale))
 
-        base_w, base_h = 340, 820
+        base_w, base_h = 340, 980
         win_w = min(sc(base_w), int(root.winfo_screenwidth() * 0.9))
         win_h = min(sc(base_h), int(root.winfo_screenheight() * 0.9))
         pos_x = max(0, (root.winfo_screenwidth() - win_w) // 2)
@@ -1323,6 +1548,101 @@ def start_ui(hostname: str):
 
         window_frame._window_map = {}
 
+        # --- Seção: Atalhos (Shortcuts) ---
+        shortcut_frame = tk.LabelFrame(
+            root, text=" Atalhos do Display Virtual ", font=("Sans", 10, "bold"),
+            padx=8, pady=5,
+        )
+        shortcut_frame.pack(fill="x", padx=15, pady=(8, 0))
+
+        shortcut_listbox_frame = tk.Frame(shortcut_frame)
+        shortcut_listbox_frame.pack(fill="x", pady=(2, 4))
+
+        shortcut_listbox = tk.Listbox(shortcut_listbox_frame, height=4, font=("Consolas", 9))
+        shortcut_scrollbar = tk.Scrollbar(shortcut_listbox_frame, orient="vertical", command=shortcut_listbox.yview)
+        shortcut_listbox.configure(yscrollcommand=shortcut_scrollbar.set)
+        shortcut_listbox.pack(side="left", fill="both", expand=True)
+        shortcut_scrollbar.pack(side="right", fill="y")
+
+        shortcut_status_label = tk.Label(
+            shortcut_frame, text="Nenhum atalho definido",
+            font=("Sans", 8), fg="gray",
+        )
+        shortcut_status_label.pack()
+
+        def refresh_shortcuts():
+            """Atualiza a lista de atalhos."""
+            shortcut_listbox.delete(0, tk.END)
+            shortcuts = _load_shortcuts()
+            for s in shortcuts:
+                shortcut_listbox.insert(tk.END, f"{s['name']}  ->  {s['command']}")
+            n = len(shortcuts)
+            shortcut_status_label.config(
+                text=f"{n} atalho(s) definido(s)" if n else "Nenhum atalho definido",
+                fg="#2e7d32" if n else "gray",
+            )
+
+        def add_shortcut():
+            """Abre dialog para adicionar atalho."""
+            dialog = tk.Toplevel(root)
+            dialog.title("Novo Atalho")
+            dialog.geometry("400x180")
+            dialog.resizable(False, False)
+            dialog.transient(root)
+            dialog.grab_set()
+
+            tk.Label(dialog, text="Nome do atalho:", font=("Sans", 10)).pack(pady=(12, 2), padx=15, anchor="w")
+            name_entry = tk.Entry(dialog, font=("Consolas", 10))
+            name_entry.pack(fill="x", padx=15)
+            name_entry.focus_set()
+
+            tk.Label(dialog, text="Comando (será executado no display virtual):", font=("Sans", 10)).pack(pady=(8, 2), padx=15, anchor="w")
+            cmd_entry = tk.Entry(dialog, font=("Consolas", 10))
+            cmd_entry.pack(fill="x", padx=15)
+
+            def save():
+                name = name_entry.get().strip()
+                command = cmd_entry.get().strip()
+                if not name or not command:
+                    shortcut_status_label.config(text="Nome e comando são obrigatórios!", fg="orange")
+                    return
+                shortcuts = _load_shortcuts()
+                existing = next((i for i, s in enumerate(shortcuts) if s["name"] == name), None)
+                if existing is not None:
+                    shortcuts[existing]["command"] = command
+                else:
+                    shortcuts.append({"name": name, "command": command})
+                _save_shortcuts(shortcuts)
+                refresh_shortcuts()
+                dialog.destroy()
+                log.info("Atalho adicionado/editado: %s", name)
+
+            tk.Button(dialog, text="Salvar", command=save, font=("Sans", 10)).pack(pady=12)
+
+        def remove_shortcut():
+            """Remove o atalho selecionado."""
+            sel = shortcut_listbox.curselection()
+            if not sel:
+                shortcut_status_label.config(text="Selecione um atalho para remover", fg="orange")
+                return
+            idx = sel[0]
+            shortcuts = _load_shortcuts()
+            if 0 <= idx < len(shortcuts):
+                name = shortcuts[idx]["name"]
+                shortcuts.pop(idx)
+                _save_shortcuts(shortcuts)
+                refresh_shortcuts()
+                log.info("Atalho removido: %s", name)
+
+        shortcut_btn_frame = tk.Frame(shortcut_frame)
+        shortcut_btn_frame.pack(pady=(2, 0))
+        tk.Button(shortcut_btn_frame, text="Adicionar", command=add_shortcut, font=("Sans", 9)).pack(side="left", padx=3)
+        tk.Button(shortcut_btn_frame, text="Remover", command=remove_shortcut, font=("Sans", 9)).pack(side="left", padx=3)
+        tk.Button(shortcut_btn_frame, text="Atualizar", command=refresh_shortcuts, font=("Sans", 9)).pack(side="left", padx=3)
+
+        # Carrega atalhos iniciais
+        refresh_shortcuts()
+
         usb_label = tk.Label(root, text="Cabo USB: verificando...", fg="gray", font=("Sans", 9))
         usb_label.pack(pady=(8, 0))
 
@@ -1365,6 +1685,8 @@ def build_app() -> web.Application:
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("/status", status_handler)
     app.router.add_get("/windows", windows_handler)
+    app.router.add_route("*", "/shortcuts", shortcuts_handler)
+    app.router.add_post("/shortcuts/execute", shortcuts_execute_handler)
     app.on_shutdown.append(on_shutdown)
     return app
 

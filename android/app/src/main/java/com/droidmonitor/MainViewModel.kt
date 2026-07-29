@@ -15,11 +15,16 @@ import com.droidmonitor.settings.SettingsRepository
 import com.droidmonitor.webrtc.RemoteLog
 import com.droidmonitor.webrtc.SignalingClient
 import com.droidmonitor.webrtc.WebRtcClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
 import org.webrtc.VideoTrack
+import java.util.concurrent.TimeUnit
 
 /** Telas possíveis do app. */
 sealed class Screen {
@@ -32,6 +37,9 @@ sealed class Screen {
     /** Tela cheia de Configurações, acessada a partir da Descoberta. */
     data object Settings : Screen()
 }
+
+/** Representa um atalho vindo do servidor. */
+data class ShortcutItem(val name: String)
 
 data class UiState(
     val discoveredPcs: List<PcInfo> = emptyList(),
@@ -47,6 +55,16 @@ data class UiState(
     /** Preenchido quando o PC não conseguiu atender ao modo pedido (ex.: pediu
      *  "extend" e o PC caiu para "mirror") — a UI mostra e depois limpa. */
     val modeNotice: String? = null,
+    /** Modo atualmente ativo (resolvido pelo servidor). */
+    val resolvedMode: String = "mirror",
+    /** Lista de atalhos do servidor (nomes). */
+    val shortcuts: List<ShortcutItem> = emptyList(),
+    /** Se está carregando atalhos do servidor. */
+    val shortcutsLoading: Boolean = false,
+    /** PC conectado (para reconexão automática ao trocar modo). */
+    val connectedPc: PcInfo? = null,
+    /** PIN usado na conexão atual. */
+    val connectedPin: String = "",
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -61,6 +79,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
     private var signalingClient: SignalingClient? = null
     private var webRtcClient: WebRtcClient? = null
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .build()
 
     init {
         val initialSettings = settingsRepository.load()
@@ -194,7 +216,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         rtc.listener = object : WebRtcClient.Listener {
             override fun onRemoteVideoTrack(track: VideoTrack) {
                 _remoteVideoTrack.value = track
-                _uiState.update { it.copy(screen = Screen.Connected) }
+                _uiState.update {
+                    it.copy(
+                        screen = Screen.Connected,
+                        connectedPc = pc,
+                        connectedPin = pin,
+                    )
+                }
+                // Ao conectar, busca atalhos do servidor
+                fetchShortcuts(pc.host, pc.port)
             }
 
             override fun onControlChannelReady() {
@@ -206,6 +236,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             override fun onModeResolved(requestedMode: String, resolvedMode: String, reason: String?) {
+                _uiState.update { it.copy(resolvedMode = resolvedMode) }
                 if (requestedMode != resolvedMode) {
                     RemoteLog.w("MainViewModel", "Modo pedido '$requestedMode' caiu para '$resolvedMode'" + (reason?.let { ": $it" } ?: ""))
                     val app = getApplication<Application>()
@@ -256,6 +287,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { it.copy(screen = Screen.ConnectionError(app.getString(R.string.signaling_closed_by_pc))) }
                 }
             }
+
+            override fun onModeChanged(resolvedMode: String, modeFallbackReason: String?) {
+                _uiState.update { it.copy(resolvedMode = resolvedMode) }
+                if (modeFallbackReason != null) {
+                    val app = getApplication<Application>()
+                    val base = app.getString(R.string.mode_fallback_notice)
+                    val notice = "$base ($modeFallbackReason)"
+                    _uiState.update { it.copy(modeNotice = notice) }
+                }
+            }
         }
 
         viewModelScope.launch {
@@ -267,6 +308,57 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun changeQuality(quality: String) {
         _uiState.update { it.copy(quality = quality) }
         signalingClient?.sendQualityChange(quality)
+    }
+
+    /** Solicita mudança de modo durante conexão ativa (Espelhar <-> Estender). */
+    fun switchMode(newMode: String) {
+        _uiState.update { it.copy(screenMode = newMode) }
+        signalingClient?.sendModeChange(newMode)
+    }
+
+    /** Busca atalhos do servidor via REST. */
+    fun fetchShortcuts(host: String, port: Int) {
+        _uiState.update { it.copy(shortcutsLoading = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val url = "http://$host:$port/shortcuts"
+                val request = Request.Builder().url(url).get().build()
+                val response = httpClient.newCall(request).execute()
+                if (response.isSuccessful) {
+                    val body = response.body?.string() ?: "{}"
+                    val json = JSONObject(body)
+                    val arr = json.optJSONArray("shortcuts")
+                    val items = mutableListOf<ShortcutItem>()
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val obj = arr.getJSONObject(i)
+                            items.add(ShortcutItem(name = obj.getString("name")))
+                        }
+                    }
+                    _uiState.update {
+                        it.copy(
+                            shortcuts = items,
+                            shortcutsLoading = false,
+                        )
+                    }
+                } else {
+                    _uiState.update { it.copy(shortcutsLoading = false) }
+                }
+            } catch (e: Exception) {
+                RemoteLog.w("MainViewModel", "Erro ao buscar atalhos: ${e.message}")
+                _uiState.update { it.copy(shortcutsLoading = false) }
+            }
+        }
+    }
+
+    /** Executa um atalho no displaydigital do servidor. */
+    fun executeShortcut(name: String) {
+        signalingClient?.sendExecuteShortcut(name)
+    }
+
+    /** Envia as novas dimensões da tela (rotação do celular). */
+    fun sendScreenResize(width: Int, height: Int) {
+        signalingClient?.sendResize(width, height)
     }
 
     /** Ignorado silenciosamente se "Permitir controle por toque" estiver desligado
@@ -281,17 +373,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         get() = webRtcClient
 
     /** Retorna a resolução real da tela (incluindo barras do sistema). */
-    private fun getRealScreenSize(): Pair<Int, Int> {
+    fun getRealScreenSize(): Pair<Int, Int> {
         val windowManager = getApplication<Application>()
             .getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-            if (windowManager != null) {
-                val display = windowManager.defaultDisplay
-                val point = Point()
-                display.getRealSize(point)
-                if (point.x > 0 && point.y > 0) {
-                    return Pair(point.x, point.y)
-                }
+        if (windowManager != null) {
+            val display = windowManager.defaultDisplay
+            val point = Point()
+            display.getRealSize(point)
+            if (point.x > 0 && point.y > 0) {
+                return Pair(point.x, point.y)
             }
+        }
         // Fallback: DisplayMetrics
         val metrics = getApplication<Application>().resources.displayMetrics
         return Pair(metrics.widthPixels, metrics.heightPixels)
@@ -303,7 +395,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         webRtcClient = null
         signalingClient = null
         _remoteVideoTrack.value = null
-        _uiState.update { it.copy(screen = Screen.Discovery, pinError = null, modeNotice = null) }
+        _uiState.update { it.copy(screen = Screen.Discovery, pinError = null, modeNotice = null, shortcuts = emptyList()) }
     }
 
     override fun onCleared() {

@@ -17,6 +17,10 @@ private const val TAG = "SignalingClient"
  *   -> {"type":"offer","sdp":...,"sdpType":"offer","quality":"480p","mode":"mirror"|"extend"}
  *   <- {"type":"answer","sdp":...,"sdpType":"answer","mode":"mirror"|"extend","modeFallbackReason":string|null}
  *   -> {"type":"quality","value":"720p"}  // ou "auto", "144p".."1080p"
+ *   -> {"type":"mode_change","mode":"mirror"|"extend"}
+ *   <- {"type":"mode_changed","mode":"mirror"|"extend","modeFallbackReason":string|null}
+ *   -> {"type":"resize","width":1080,"height":2400}
+ *   -> {"type":"execute_shortcut","name":"Abrir Firefox"}
  *   -> {"type":"log","level":"INFO"|"WARN"|"ERROR","tag":"...","message":"..."}
  *      // eventos de conexão do app (ver RemoteLog), aparecem no terminal do PC
  *      // com o prefixo "[Celular]" — funciona mesmo antes do PIN ser aceito.
@@ -38,6 +42,8 @@ class SignalingClient(
         fun onAnswerReceived(sdp: String, sdpType: String, resolvedMode: String, modeFallbackReason: String?)
         fun onSignalingError(message: String)
         fun onSignalingClosed()
+        /** Chamado quando o servidor confirma a mudança de modo. */
+        fun onModeChanged(resolvedMode: String, modeFallbackReason: String?)
     }
 
     private var webSocket: WebSocket? = null
@@ -97,6 +103,10 @@ class SignalingClient(
                 resolvedMode = json.optString("mode", "mirror"),
                 modeFallbackReason = if (json.isNull("modeFallbackReason")) null else json.optString("modeFallbackReason"),
             )
+            "mode_changed" -> listener?.onModeChanged(
+                resolvedMode = json.optString("mode", "mirror"),
+                modeFallbackReason = if (json.isNull("modeFallbackReason")) null else json.optString("modeFallbackReason"),
+            )
             "error" -> listener?.onSignalingError(json.optString("message", "Erro desconhecido"))
         }
     }
@@ -126,6 +136,31 @@ class SignalingClient(
         send(JSONObject().apply {
             put("type", "quality")
             put("value", quality)
+        })
+    }
+
+    /** Solicita mudança de modo (Espelhar <-> Estender) durante conexão ativa. */
+    fun sendModeChange(mode: String) {
+        send(JSONObject().apply {
+            put("type", "mode_change")
+            put("mode", mode)
+        })
+    }
+
+    /** Envia as novas dimensões da tela do celular (rotação). */
+    fun sendResize(width: Int, height: Int) {
+        send(JSONObject().apply {
+            put("type", "resize")
+            put("width", width)
+            put("height", height)
+        })
+    }
+
+    /** Solicita execução de um atalho no displaydigital. */
+    fun sendExecuteShortcut(name: String) {
+        send(JSONObject().apply {
+            put("type", "execute_shortcut")
+            put("name", name)
         })
     }
 

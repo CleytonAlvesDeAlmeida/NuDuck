@@ -52,6 +52,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -151,6 +152,10 @@ fun DroidMonitorApp(viewModel: MainViewModel, windowSizeClass: WindowSizeClass) 
             modeNotice = uiState.modeNotice,
             onDismissModeNotice = viewModel::dismissModeNotice,
             onSettingsChange = viewModel::updateSettings,
+            resolvedMode = uiState.resolvedMode,
+            shortcuts = uiState.shortcuts,
+            shortcutsLoading = uiState.shortcutsLoading,
+            connectedPc = uiState.connectedPc,
         )
 
         is Screen.ConnectionError -> ConnectionErrorScreen(
@@ -462,9 +467,21 @@ fun ConnectedScreen(
     modeNotice: String?,
     onDismissModeNotice: () -> Unit,
     onSettingsChange: (com.droidmonitor.settings.AppSettings) -> Unit,
+    resolvedMode: String,
+    shortcuts: List<com.droidmonitor.ShortcutItem>,
+    shortcutsLoading: Boolean,
+    connectedPc: com.droidmonitor.discovery.PcInfo?,
 ) {
     val remoteTrack by viewModel.remoteVideoTrack.collectAsState()
     var showSettingsDialog by remember { mutableStateOf(false) }
+
+    // Detecta rotação do celular e envia nova resolução ao servidor.
+    // No modo Estender, isso faz o Xvfb ser redimensionado automaticamente.
+    val configuration = LocalConfiguration.current
+    LaunchedEffect(configuration.orientation) {
+        val (w, h) = viewModel.getRealScreenSize()
+        viewModel.sendScreenResize(w, h)
+    }
 
     // Some sozinho depois de alguns segundos, sem precisar de interação.
     // Mais tempo que antes: agora o aviso pode incluir o motivo técnico
@@ -503,6 +520,14 @@ fun ConnectedScreen(
             onQualityChange = viewModel::changeQuality,
             onOpenSettings = { showSettingsDialog = true },
             onDisconnect = viewModel::disconnect,
+            currentMode = resolvedMode,
+            onModeChange = viewModel::switchMode,
+            shortcuts = shortcuts,
+            shortcutsLoading = shortcutsLoading,
+            onExecuteShortcut = viewModel::executeShortcut,
+            onRefreshShortcuts = {
+                connectedPc?.let { viewModel.fetchShortcuts(it.host, it.port) }
+            },
         )
 
         if (modeNotice != null) {

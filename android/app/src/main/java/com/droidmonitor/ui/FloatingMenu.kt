@@ -23,8 +23,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.HighQuality
+import androidx.compose.material.icons.filled.KeyboardAlt
 import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -47,11 +50,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.droidmonitor.R
+import com.droidmonitor.ShortcutItem
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 /** Estados possíveis do menu flutuante do NuDuck durante a transmissão. */
-private enum class MenuStage { COLLAPSED, EXPANDED, QUALITY }
+private enum class MenuStage { COLLAPSED, EXPANDED, QUALITY, MODE, SHORTCUTS }
 
 private val MenuBlack = Color(0xFF0B0B0B)
 private const val IDLE_TIMEOUT_MS = 3500L
@@ -74,10 +78,16 @@ fun FloatingMenuHost(
     onQualityChange: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onDisconnect: () -> Unit,
+    currentMode: String = "mirror",
+    onModeChange: (String) -> Unit,
+    shortcuts: List<ShortcutItem> = emptyList(),
+    shortcutsLoading: Boolean = false,
+    onExecuteShortcut: (String) -> Unit,
+    onRefreshShortcuts: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var stage by remember { mutableStateOf(MenuStage.COLLAPSED) }
-    var dragOffset by remember { mutableStateOf<Offset?>(null) } // null = posição inicial (topo-direita)
+    var dragOffset by remember { mutableStateOf<Offset?>(null) }
     var interactionTick by remember { mutableIntStateOf(0) }
     val density = LocalDensity.current
 
@@ -94,8 +104,6 @@ fun FloatingMenuHost(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-        // Scrim invisível: só existe quando o menu está aberto, captura o toque
-        // "fora do menu" para fechá-lo sem repassar esse toque ao vídeo remoto.
         if (stage != MenuStage.COLLAPSED) {
             Box(
                 modifier = Modifier
@@ -123,7 +131,6 @@ fun FloatingMenuHost(
                     ) { change, dragAmount ->
                         change.consume()
                         val base = dragOffset ?: Offset(initialX, initialY)
-                        // x cresce para a esquerda pois o menu é ancorado no canto superior direito
                         dragOffset = Offset(
                             x = (base.x - dragAmount.x).coerceAtLeast(0f),
                             y = (base.y + dragAmount.y).coerceAtLeast(0f),
@@ -142,6 +149,12 @@ fun FloatingMenuHost(
                 MenuStage.COLLAPSED -> CollapsedButton(alpha = alpha.value)
                 MenuStage.EXPANDED -> ExpandedPanel(
                     onQuality = { markInteraction(); stage = MenuStage.QUALITY },
+                    onMode = { markInteraction(); stage = MenuStage.MODE },
+                    onShortcuts = {
+                        markInteraction()
+                        stage = MenuStage.SHORTCUTS
+                        onRefreshShortcuts()
+                    },
                     onSettings = { markInteraction(); onOpenSettings() },
                     onDisconnect = { markInteraction(); onDisconnect() },
                 )
@@ -150,6 +163,17 @@ fun FloatingMenuHost(
                     qualityLabels = qualityLabels,
                     onBack = { markInteraction(); stage = MenuStage.EXPANDED },
                     onSelect = { value -> markInteraction(); onQualityChange(value) },
+                )
+                MenuStage.MODE -> ModePanel(
+                    currentMode = currentMode,
+                    onBack = { markInteraction(); stage = MenuStage.EXPANDED },
+                    onSelect = { mode -> markInteraction(); onModeChange(mode) },
+                )
+                MenuStage.SHORTCUTS -> ShortcutsPanel(
+                    shortcuts = shortcuts,
+                    loading = shortcutsLoading,
+                    onBack = { markInteraction(); stage = MenuStage.EXPANDED },
+                    onExecute = { name -> markInteraction(); onExecuteShortcut(name) },
                 )
             }
         }
@@ -176,6 +200,8 @@ private fun CollapsedButton(alpha: Float) {
 @Composable
 private fun ExpandedPanel(
     onQuality: () -> Unit,
+    onMode: () -> Unit,
+    onShortcuts: () -> Unit,
     onSettings: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -185,6 +211,8 @@ private fun ExpandedPanel(
             .background(MenuBlack, RoundedCornerShape(14.dp))
             .padding(vertical = 8.dp),
     ) {
+        MenuRow(icon = Icons.Filled.PhoneAndroid, label = stringResource(R.string.menu_mode), onClick = onMode)
+        MenuRow(icon = Icons.Filled.KeyboardAlt, label = stringResource(R.string.menu_shortcuts), onClick = onShortcuts)
         MenuRow(icon = Icons.Filled.HighQuality, label = stringResource(R.string.menu_quality), onClick = onQuality)
         MenuRow(icon = Icons.Filled.Settings, label = stringResource(R.string.menu_settings), onClick = onSettings)
         MenuRow(icon = Icons.Filled.LinkOff, label = stringResource(R.string.menu_disconnect), onClick = onDisconnect, danger = true)
@@ -208,6 +236,165 @@ private fun MenuRow(icon: ImageVector, label: String, onClick: () -> Unit, dange
         )
         Spacer(modifier = Modifier.size(12.dp))
         Text(text = label, color = if (danger) Color(0xFFFF6B6B) else Color.White)
+    }
+}
+
+@Composable
+private fun ModePanel(
+    currentMode: String,
+    onBack: () -> Unit,
+    onSelect: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .width(220.dp)
+            .background(MenuBlack, RoundedCornerShape(14.dp))
+            .padding(vertical = 8.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .tapClick(onBack)
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.ArrowBack,
+                contentDescription = stringResource(R.string.menu_back),
+                tint = Color(0xFF9CA3AF),
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.size(8.dp))
+            Text(text = stringResource(R.string.menu_mode), color = Color(0xFF9CA3AF))
+        }
+
+        ModeRow(
+            label = stringResource(R.string.menu_mode_mirror),
+            description = stringResource(R.string.menu_mode_mirror_desc),
+            selected = currentMode == "mirror",
+            onClick = { onSelect("mirror") },
+        )
+        ModeRow(
+            label = stringResource(R.string.menu_mode_extend),
+            description = stringResource(R.string.menu_mode_extend_desc),
+            selected = currentMode == "extend",
+            onClick = { onSelect("extend") },
+        )
+    }
+}
+
+@Composable
+private fun ModeRow(
+    label: String,
+    description: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier
+            .fillMaxWidth()
+            .tapClick(onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = label, color = Color.White)
+            Text(text = description, color = Color(0xFF9CA3AF), style = androidx.compose.material3.MaterialTheme.typography.bodySmall)
+        }
+        if (selected) {
+            Icon(
+                imageVector = Icons.Filled.ArrowBack,
+                contentDescription = null,
+                tint = Color(0xFF38BDF8),
+                modifier = Modifier.size(16.dp).rotate(180f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ShortcutsPanel(
+    shortcuts: List<ShortcutItem>,
+    loading: Boolean,
+    onBack: () -> Unit,
+    onExecute: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .width(240.dp)
+            .heightIn(max = 320.dp)
+            .background(MenuBlack, RoundedCornerShape(14.dp))
+            .padding(vertical = 8.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .tapClick(onBack)
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.ArrowBack,
+                contentDescription = stringResource(R.string.menu_back),
+                tint = Color(0xFF9CA3AF),
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.size(8.dp))
+            Text(text = stringResource(R.string.menu_shortcuts), color = Color(0xFF9CA3AF))
+        }
+
+        if (loading) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Color(0xFF38BDF8), modifier = Modifier.size(20.dp))
+                Spacer(modifier = Modifier.size(8.dp))
+                Text(
+                    text = stringResource(R.string.menu_shortcuts_loading),
+                    color = Color(0xFF9CA3AF),
+                    style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                )
+            }
+        } else if (shortcuts.isEmpty()) {
+            Text(
+                text = stringResource(R.string.menu_shortcuts_empty),
+                color = Color(0xFF9CA3AF),
+                style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            )
+        } else {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                shortcuts.forEach { shortcut ->
+                    ShortcutRow(
+                        name = shortcut.name,
+                        onClick = { onExecute(shortcut.name) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShortcutRow(
+    name: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .tapClick(onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        Text(text = name, color = Color.White)
     }
 }
 
@@ -265,8 +452,6 @@ private fun QualityRow(label: String, selected: Boolean, onClick: () -> Unit) {
     ) {
         Text(text = label, color = Color.White)
         if (selected) {
-            // Reaproveita o ícone de "voltar" rotacionado como seta indicadora,
-            // evitando adicionar mais um ícone só para este destaque.
             Icon(
                 imageVector = Icons.Filled.ArrowBack,
                 contentDescription = stringResource(R.string.menu_quality_selected_cd),

@@ -686,6 +686,146 @@ root.mainloop()
             return False
         return True
 
+    def resize(self, new_width: int, new_height: int) -> bool:
+        """Redimensiona o display virtual Xvfb.
+
+        O Xvfb não suporta redimensionamento dinâmico nativamente, então
+        este método para e recria o Xvfb com as novas dimensões, mantendo
+        o mesmo número de display.
+
+        Retorna True se sucesso, False caso contrário.
+        """
+        if not self._started or not self.display_name:
+            return False
+
+        old_display_name = self.display_name
+        old_display_num = self.display_num
+        new_width = max(320, min(new_width, 3840))
+        new_height = max(240, min(new_height, 2160))
+
+        log.info("Redimensionando Xvfb %s: %dx%d -> %dx%d", old_display_name, self.width, self.height, new_width, new_height)
+
+        # Para captura
+        if self._stop_event:
+            self._stop_event.set()
+        if self._capture_thread and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=3)
+        self._capture_thread = None
+
+        # Fecha mss
+        if self._mss_instance is not None:
+            try:
+                self._mss_instance.close()
+            except Exception:
+                pass
+            self._mss_instance = None
+
+        # Mata WM
+        if self.wm_process:
+            try:
+                self.wm_process.terminate()
+                self.wm_process.wait(timeout=2)
+            except Exception:
+                pass
+            self.wm_process = None
+
+        # Mata Xvfb
+        if self.xvfb_process:
+            try:
+                self.xvfb_process.terminate()
+                self.xvfb_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self.xvfb_process.kill()
+                except Exception:
+                    pass
+            self.xvfb_process = None
+
+        # Limpa arquivos de socket
+        for f in (f"/tmp/.X{old_display_num}-lock", f"/tmp/.X11-unix/X{old_display_num}"):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+
+        # Atualiza dimensões
+        self.width = new_width
+        self.height = new_height
+        self._shape = (new_height, new_width, 3)
+        self.display_name = old_display_name
+        self.display_num = old_display_num
+
+        # Recria o Xvfb
+        try:
+            self.xvfb_process = subprocess.Popen(
+                [
+                    "Xvfb", self.display_name,
+                    "-screen", "0", f"{self.width}x{self.height}x{self.depth}",
+                    "-ac", "-nolisten", "tcp",
+                    "+extension", "RANDR",
+                    "+extension", "RENDER",
+                    "+extension", "XFIXES",
+                    "+extension", "MIT-SHM",
+                    "+extension", "BIG-REQUESTS",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            time.sleep(0.6)
+
+            if self.xvfb_process.poll() is not None:
+                stderr = self.xvfb_process.stderr.read().decode(errors="replace").strip()
+                log.error("Xvfb falhou ao recriar (rc=%d): %s", self.xvfb_process.returncode, stderr)
+                self._started = False
+                return False
+        except Exception as exc:
+            log.error("Erro ao recriar Xvfb: %s", exc)
+            self._started = False
+            return False
+
+        # Cor de fundo
+        env = {**os.environ, "DISPLAY": self.display_name}
+        try:
+            subprocess.run(
+                ["xsetroot", "-solid", "#1a1a2e"],
+                env=env, capture_output=True, timeout=3,
+            )
+        except Exception:
+            pass
+
+        # Reinicia WM
+        for wm in ("openbox", "fluxbox", "twm", "fvwm"):
+            if shutil.which(wm):
+                try:
+                    self.wm_process = subprocess.Popen(
+                        [wm], env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    self._wm_name = wm
+                    break
+                except Exception:
+                    continue
+
+        # Abre terminal inicial
+        self._open_initial_terminal(env)
+
+        # Reinicia captura
+        self._start_capture_thread()
+
+        # Espera estabilizar
+        time.sleep(2.0)
+        if self._new_frame_event and self._new_frame_event.is_set():
+            self._capture_ok = True
+        else:
+            self._capture_ok = False
+            log.warning("Captura pode não estar funcionando após resize.")
+
+        self._started = True
+        log.info("Xvfb redimensionado com sucesso: %s (%dx%d)", self.display_name, self.width, self.height)
+        return True
+
     def get_frame(self):
         """Retorna o último frame BGR (H, W, 3), ou gera um frame colorido."""
         if not self._started or self._latest_frame is None:

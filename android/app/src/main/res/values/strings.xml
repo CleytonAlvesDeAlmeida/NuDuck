@@ -68,6 +68,14 @@
     <string name="menu_disconnect">Desconectar</string>
     <string name="menu_back">Voltar</string>
     <string name="menu_quality_selected_cd">Qualidade selecionada</string>
+    <string name="menu_mode">Modo</string>
+    <string name="menu_mode_mirror">Espelhar</string>
+    <string name="menu_mode_extend">Estender</string>
+    <string name="menu_mode_mirror_desc">Repete a tela do PC</string>
+    <string name="menu_mode_extend_desc">Segunda tela virtual</string>
+    <string name="menu_shortcuts">Atalhos</string>
+    <string name="menu_shortcuts_empty">Nenhum atalho definido no servidor</string>
+    <string name="menu_shortcuts_loading">Carregando atalhos…</string>
 
     <!-- Leitura de QR Code -->
     <string name="qr_scan_hint">Aponte a câmera para o QR Code exibido no PC</string>
