@@ -29,6 +29,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -53,7 +54,41 @@ import json as _json
 # Atalhos do servidor (salvos em shortcuts.json)
 # ==========================================================================
 
-SHORTCUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortcuts.json")
+def _get_persistent_data_dir() -> str:
+    """Retorna uma pasta pra guardar dados do usuário (atalhos, etc.) que
+    sobrevive a reinicializações do programa.
+
+    Quando rodando direto do código (`python3 server.py`), usa a própria
+    pasta do projeto — como sempre foi.
+
+    Quando empacotado como executável único pelo PyInstaller (--onefile),
+    `__file__`/`sys.executable` apontam pra dentro de uma pasta TEMPORÁRIA
+    que o PyInstaller cria do zero e APAGA toda vez que o programa fecha
+    (ex: algo como C:\\Users\\...\\AppData\\Local\\Temp\\_MEIxxxxxx). Qualquer
+    coisa salva lá dentro (como os atalhos) some no próximo "abrir o app" —
+    era exatamente esse o motivo dos atalhos não persistirem. Por isso, no
+    executável, salvamos numa pasta de configuração de verdade do sistema
+    (AppData no Windows, ~/.config no Linux/Mac), que não é apagada nunca.
+    """
+    if getattr(sys, "frozen", False):
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        elif sys.platform == "darwin":
+            base = os.path.expanduser("~/Library/Application Support")
+        else:
+            base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        data_dir = os.path.join(base, "NuDuck")
+    else:
+        data_dir = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception as exc:
+        log.error("Não consegui criar pasta de dados %s: %s", data_dir, exc)
+    return data_dir
+
+
+SHORTCUTS_FILE = os.path.join(_get_persistent_data_dir(), "shortcuts.json")
 
 
 def _load_shortcuts() -> list:
@@ -1355,8 +1390,24 @@ def start_ui(hostname: str):
     def run():
         nonlocal_state = {"log_window": None}
 
+        # ---- Paleta de cores — igual à do app Android (ver Theme.kt) ----
+        BG_MAIN = "#0F172A"       # background do app
+        BG_SURFACE = "#0B0B0B"    # surface (topo/menus) do app
+        BG_CARD = "#182338"       # tom intermediário, pros "cartões"/abas
+        BG_FIELD = "#1E293B"      # fundo de campos de entrada/lista
+        FG_TEXT = "#F1F5F9"
+        FG_MUTED = "#94A3B8"
+        ACCENT_BLUE = "#38BDF8"   # primary do app
+        ACCENT_BLUE_DK = "#0EA5E9"  # secondary do app
+        ACCENT_ORANGE = "#EC5E00"   # tertiary do app (laranja do logo)
+        COLOR_OK = "#22C55E"
+        COLOR_WARN = "#F59E0B"
+        COLOR_DANGER = "#DC2626"
+        COLOR_DANGER_DK = "#991B1B"
+
         root = tk.Tk()
         root.title(APP_NAME)
+        root.configure(bg=BG_MAIN)
 
         # Escala pra telas HiDPI/4K
         try:
@@ -1369,14 +1420,57 @@ def start_ui(hostname: str):
         def sc(px: int) -> int:
             return int(round(px * ui_scale))
 
-        base_w, base_h = 340, 980
+        # Janela mais baixa que antes — o conteúdo agora fica em abas em
+        # vez de tudo empilhado numa coluna só (por isso 980px de altura
+        # não é mais necessário).
+        base_w, base_h = 360, 700
         win_w = min(sc(base_w), int(root.winfo_screenwidth() * 0.9))
         win_h = min(sc(base_h), int(root.winfo_screenheight() * 0.9))
         pos_x = max(0, (root.winfo_screenwidth() - win_w) // 2)
         pos_y = max(0, (root.winfo_screenheight() - win_h) // 3)
         root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-        root.minsize(sc(280), sc(420))
+        root.minsize(sc(300), sc(480))
         root.resizable(True, True)
+
+        # ---- Estilo ttk (Notebook/Combobox não têm equivalente puro em tk) ----
+        style = ttk.Style(root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure("TNotebook", background=BG_MAIN, borderwidth=0)
+        style.configure(
+            "TNotebook.Tab", background=BG_SURFACE, foreground=FG_MUTED,
+            padding=(sc(14), sc(7)), font=("Sans", 9, "bold"), borderwidth=0,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", BG_CARD)],
+            foreground=[("selected", ACCENT_BLUE)],
+        )
+        style.configure("Card.TFrame", background=BG_CARD)
+        style.configure(
+            "TCombobox", fieldbackground=BG_FIELD, background=BG_FIELD,
+            foreground=FG_TEXT, arrowcolor=FG_TEXT, borderwidth=0,
+            selectbackground=BG_FIELD, selectforeground=FG_TEXT,
+            insertcolor=FG_TEXT, bordercolor=BG_FIELD,
+            lightcolor=BG_FIELD, darkcolor=BG_FIELD, relief="flat",
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", BG_FIELD), ("disabled", BG_FIELD), ("!disabled", BG_FIELD)],
+            selectbackground=[("readonly", BG_FIELD)],
+            selectforeground=[("readonly", FG_TEXT)],
+            foreground=[("readonly", FG_TEXT), ("disabled", FG_MUTED)],
+            background=[("readonly", BG_FIELD), ("active", BG_FIELD)],
+        )
+        # A lista suspensa do Combobox é uma Listbox "crua" do Tk por baixo
+        # dos panos — não segue o ttk.Style, precisa ser configurada à parte.
+        root.option_add("*TCombobox*Listbox.background", BG_FIELD)
+        root.option_add("*TCombobox*Listbox.foreground", FG_TEXT)
+        root.option_add("*TCombobox*Listbox.selectBackground", ACCENT_BLUE)
+        root.option_add("*TCombobox*Listbox.selectForeground", "#00202B")
 
         def shutdown():
             log.info("Encerrando %s...", APP_NAME)
@@ -1396,7 +1490,7 @@ def start_ui(hostname: str):
 
             import tkinter.scrolledtext as scrolledtext
 
-            win = tk.Toplevel(root)
+            win = tk.Toplevel(root, bg=BG_MAIN)
             win.title(f"{APP_NAME} — Terminal")
             log_w = min(sc(640), int(root.winfo_screenwidth() * 0.9))
             log_h = min(sc(420), int(root.winfo_screenheight() * 0.9))
@@ -1405,7 +1499,7 @@ def start_ui(hostname: str):
 
             text = scrolledtext.ScrolledText(
                 win, bg="#0b0b0b", fg="#e6e6e6", insertbackground="#e6e6e6",
-                font=("Consolas", 9),
+                font=("Consolas", 9), borderwidth=0,
             )
             text.pack(fill="both", expand=True)
             text.configure(state="disabled")
@@ -1438,19 +1532,36 @@ def start_ui(hostname: str):
         except Exception as exc:
             log.warning("Ícone não encontrado (%s).", exc)
 
-        tk.Label(root, text=APP_NAME, font=("Sans", 16, "bold")).pack(pady=(15, 5))
-        tk.Label(root, text="PIN de conexão:", font=("Sans", 11)).pack()
-        tk.Label(root, text=STATE.pin, font=("Sans", 28, "bold")).pack(pady=(0, 10))
+        # ================= Cabeçalho (fixo, sempre visível) =================
+        header = tk.Frame(root, bg=BG_SURFACE)
+        header.pack(fill="x")
+
+        tk.Label(
+            header, text=APP_NAME, font=("Sans", 17, "bold"),
+            bg=BG_SURFACE, fg=ACCENT_BLUE,
+        ).pack(pady=(14, 2))
+        tk.Label(
+            header, text="PIN de conexão", font=("Sans", 10),
+            bg=BG_SURFACE, fg=FG_MUTED,
+        ).pack()
+        tk.Label(
+            header, text=STATE.pin, font=("Consolas", 30, "bold"),
+            bg=BG_SURFACE, fg=ACCENT_ORANGE,
+        ).pack(pady=(0, 8))
 
         qr_photo = _build_qr_photo(root, ui_scale)
         if qr_photo is not None:
-            qr_label = tk.Label(root, image=qr_photo)
+            qr_wrap = tk.Frame(header, bg="white", padx=6, pady=6)
+            qr_wrap.pack(pady=(0, 6))
+            qr_label = tk.Label(qr_wrap, image=qr_photo, bg="white")
             qr_label.image = qr_photo
-            qr_label.pack(pady=(0, 5))
+            qr_label.pack()
             tk.Label(
-                root, text="Escaneie no app para conectar",
-                font=("Sans", 9), fg="gray",
-            ).pack(pady=(0, 10))
+                header, text="Escaneie no app para conectar",
+                font=("Sans", 9), bg=BG_SURFACE, fg=FG_MUTED,
+            ).pack(pady=(0, 12))
+        else:
+            tk.Frame(header, bg=BG_SURFACE, height=8).pack()
 
         control_var = tk.BooleanVar(value=STATE.allow_control)
 
@@ -1461,28 +1572,58 @@ def start_ui(hostname: str):
         tk.Checkbutton(
             root, text="Permitir controle (mouse/teclado)",
             variable=control_var, command=on_toggle,
-        ).pack(pady=5)
+            bg=BG_MAIN, fg=FG_TEXT, font=("Sans", 10),
+            activebackground=BG_MAIN, activeforeground=FG_TEXT,
+            selectcolor=BG_FIELD, borderwidth=0, highlightthickness=0,
+        ).pack(pady=(10, 6))
 
-        # --- Seção: Seleção de janela para espelhar ---
-        window_frame = tk.LabelFrame(
-            root, text=" Espelhar Janela ", font=("Sans", 10, "bold"),
-            padx=8, pady=5,
-        )
-        window_frame.pack(fill="x", padx=15, pady=(8, 0))
+        # ================= Abas =================
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(2, 6))
+
+        tab_window = tk.Frame(notebook, bg=BG_CARD, padx=14, pady=14)
+        tab_shortcuts = tk.Frame(notebook, bg=BG_CARD, padx=14, pady=14)
+        tab_system = tk.Frame(notebook, bg=BG_CARD, padx=14, pady=14)
+        notebook.add(tab_window, text="  Janela  ")
+        notebook.add(tab_shortcuts, text="  Atalhos  ")
+        notebook.add(tab_system, text="  Sistema  ")
+
+        def _section_label(parent, text):
+            tk.Label(
+                parent, text=text, font=("Sans", 10, "bold"),
+                bg=BG_CARD, fg=ACCENT_BLUE, anchor="w",
+            ).pack(fill="x", pady=(0, 6))
+
+        def _hint_label(parent, text, fg=FG_MUTED):
+            lbl = tk.Label(
+                parent, text=text, font=("Sans", 8),
+                bg=BG_CARD, fg=fg, anchor="w", justify="left", wraplength=sc(280),
+            )
+            lbl.pack(fill="x", pady=(4, 0))
+            return lbl
+
+        def _flat_button(parent, text, command, accent=False, danger=False):
+            bg = COLOR_DANGER if danger else (ACCENT_BLUE if accent else BG_FIELD)
+            fg = "white" if danger else ("#00202B" if accent else FG_TEXT)
+            active_bg = COLOR_DANGER_DK if danger else (ACCENT_BLUE_DK if accent else "#243248")
+            return tk.Button(
+                parent, text=text, command=command, font=("Sans", 9, "bold" if (accent or danger) else "normal"),
+                bg=bg, fg=fg, activebackground=active_bg, activeforeground=fg,
+                borderwidth=0, relief="flat", padx=10, pady=5,
+                highlightthickness=0, cursor="hand2",
+            )
+
+        # --- Aba: Espelhar Janela ---
+        _section_label(tab_window, "Espelhar uma janela específica")
 
         window_var = tk.StringVar(value="")
-
         window_combo = ttk.Combobox(
-            window_frame, textvariable=window_var,
+            tab_window, textvariable=window_var,
             state="readonly", width=40,
         )
-        window_combo.pack(fill="x", pady=(2, 4))
+        window_combo.pack(fill="x", pady=(0, 6))
 
-        window_status_label = tk.Label(
-            window_frame, text="Clique em 'Atualizar' para ver as janelas",
-            font=("Sans", 8), fg="gray",
-        )
-        window_status_label.pack()
+        window_status_label = _hint_label(tab_window, "Clique em 'Atualizar' para ver as janelas")
 
         def refresh_windows():
             """Busca janelas abertas e atualiza o combobox."""
@@ -1490,7 +1631,7 @@ def start_ui(hostname: str):
             if not windows:
                 window_status_label.config(
                     text="Nenhuma janela encontrada (xdotool necessário)",
-                    fg="orange",
+                    fg=COLOR_WARN,
                 )
                 window_combo["values"] = []
                 window_var.set("")
@@ -1503,11 +1644,11 @@ def start_ui(hostname: str):
             window_combo["values"] = names
             window_status_label.config(
                 text=f"{len(windows)} janela(s) encontrada(s)",
-                fg="#2e7d32",
+                fg=COLOR_OK,
             )
 
             # Guarda mapeamento nome -> window id para uso ao selecionar
-            window_frame._window_map = {
+            tab_window._window_map = {
                 f"{w['name']} (PID:{w['pid'] or '?'})": w
                 for w in windows
             }
@@ -1522,7 +1663,7 @@ def start_ui(hostname: str):
         def on_window_selected(event=None):
             """Quando o usuário seleciona uma janela no combobox."""
             sel = window_var.get()
-            wmap = getattr(window_frame, "_window_map", {})
+            wmap = getattr(tab_window, "_window_map", {})
             win = wmap.get(sel)
             if win:
                 STATE.window_mode = True
@@ -1530,7 +1671,7 @@ def start_ui(hostname: str):
                 STATE.selected_window_name = win["name"]
                 window_status_label.config(
                     text=f"Janela selecionada: {win['name']}",
-                    fg="#1565c0",
+                    fg=ACCENT_BLUE,
                 )
                 log.info("Janela selecionada: %s (ID: %s)", win["name"], win["id"])
             else:
@@ -1540,50 +1681,63 @@ def start_ui(hostname: str):
 
         window_combo.bind("<<ComboboxSelected>>", on_window_selected)
 
-        refresh_btn = tk.Button(
-            window_frame, text="Atualizar janelas",
-            command=refresh_windows, font=("Sans", 9),
+        _flat_button(tab_window, "Atualizar janelas", refresh_windows).pack(pady=(6, 0))
+
+        tab_window._window_map = {}
+
+        # --- Aba: Atalhos (comandos que abrem programas na 2ª tela) ---
+        _section_label(tab_shortcuts, "Atalhos do Display Virtual")
+        _hint_label(
+            tab_shortcuts,
+            "Comandos executados na tela estendida (modo Estender). Ficam "
+            "salvos e continuam aqui mesmo depois de fechar e abrir o "
+            f"{APP_NAME} de novo.",
+        ).pack(fill="x", pady=(0, 8))
+
+        shortcut_listbox_frame = tk.Frame(tab_shortcuts, bg=BG_CARD)
+        shortcut_listbox_frame.pack(fill="x", pady=(0, 8))
+
+        shortcut_listbox = tk.Listbox(
+            shortcut_listbox_frame, height=5, font=("Consolas", 9),
+            bg=BG_FIELD, fg=FG_TEXT, selectbackground=ACCENT_BLUE,
+            selectforeground="#00202B", borderwidth=0, highlightthickness=0,
         )
-        refresh_btn.pack(pady=(2, 0))
-
-        window_frame._window_map = {}
-
-        # --- Seção: Atalhos (Shortcuts) ---
-        shortcut_frame = tk.LabelFrame(
-            root, text=" Atalhos do Display Virtual ", font=("Sans", 10, "bold"),
-            padx=8, pady=5,
-        )
-        shortcut_frame.pack(fill="x", padx=15, pady=(8, 0))
-
-        shortcut_listbox_frame = tk.Frame(shortcut_frame)
-        shortcut_listbox_frame.pack(fill="x", pady=(2, 4))
-
-        shortcut_listbox = tk.Listbox(shortcut_listbox_frame, height=4, font=("Consolas", 9))
         shortcut_scrollbar = tk.Scrollbar(shortcut_listbox_frame, orient="vertical", command=shortcut_listbox.yview)
         shortcut_listbox.configure(yscrollcommand=shortcut_scrollbar.set)
         shortcut_listbox.pack(side="left", fill="both", expand=True)
         shortcut_scrollbar.pack(side="right", fill="y")
 
-        # --- Entrada de atalhos: duas caixas de texto direto na janela ---
-        entry_frame = tk.Frame(shortcut_frame)
-        entry_frame.pack(fill="x", pady=(4, 2))
+        entry_frame = tk.Frame(tab_shortcuts, bg=BG_CARD)
+        entry_frame.pack(fill="x", pady=(0, 4))
 
-        tk.Label(entry_frame, text="Nome:", font=("Sans", 9)).grid(row=0, column=0, sticky="w", padx=(0, 4))
-        shortcut_name_entry = tk.Entry(entry_frame, font=("Consolas", 10), width=25)
-        shortcut_name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        tk.Label(
+            entry_frame, text="Nome:", font=("Sans", 9),
+            bg=BG_CARD, fg=FG_MUTED,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        shortcut_name_entry = tk.Entry(
+            entry_frame, font=("Consolas", 10), width=25,
+            bg=BG_FIELD, fg=FG_TEXT, insertbackground=FG_TEXT,
+            borderwidth=0, highlightthickness=1,
+            highlightbackground=BG_FIELD, highlightcolor=ACCENT_BLUE,
+        )
+        shortcut_name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4), pady=2)
 
-        tk.Label(entry_frame, text="Comando:", font=("Sans", 9)).grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
-        shortcut_cmd_entry = tk.Entry(entry_frame, font=("Consolas", 10), width=25)
+        tk.Label(
+            entry_frame, text="Comando:", font=("Sans", 9),
+            bg=BG_CARD, fg=FG_MUTED,
+        ).grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
+        shortcut_cmd_entry = tk.Entry(
+            entry_frame, font=("Consolas", 10), width=25,
+            bg=BG_FIELD, fg=FG_TEXT, insertbackground=FG_TEXT,
+            borderwidth=0, highlightthickness=1,
+            highlightbackground=BG_FIELD, highlightcolor=ACCENT_BLUE,
+        )
         shortcut_cmd_entry.insert(0, "DISPLAY=:1 firefox &")
-        shortcut_cmd_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(4, 0))
+        shortcut_cmd_entry.grid(row=1, column=1, sticky="ew", padx=(0, 4), pady=(4, 2))
 
         entry_frame.columnconfigure(1, weight=1)
 
-        shortcut_status_label = tk.Label(
-            shortcut_frame, text="Nenhum atalho definido",
-            font=("Sans", 8), fg="gray",
-        )
-        shortcut_status_label.pack()
+        shortcut_status_label = _hint_label(tab_shortcuts, "Nenhum atalho definido")
 
         def refresh_shortcuts():
             """Atualiza a lista de atalhos."""
@@ -1593,8 +1747,8 @@ def start_ui(hostname: str):
                 shortcut_listbox.insert(tk.END, f"{s['name']}  ->  {s['command']}")
             n = len(shortcuts)
             shortcut_status_label.config(
-                text=f"{n} atalho(s) definido(s)" if n else "Nenhum atalho definido",
-                fg="#2e7d32" if n else "gray",
+                text=f"{n} atalho(s) salvo(s)" if n else "Nenhum atalho definido",
+                fg=COLOR_OK if n else FG_MUTED,
             )
 
         def add_shortcut():
@@ -1602,16 +1756,16 @@ def start_ui(hostname: str):
             name = shortcut_name_entry.get().strip()
             command = shortcut_cmd_entry.get().strip()
             if not name or not command:
-                shortcut_status_label.config(text="Nome e comando são obrigatórios!", fg="orange")
+                shortcut_status_label.config(text="Nome e comando são obrigatórios!", fg=COLOR_WARN)
                 return
             shortcuts = _load_shortcuts()
             existing = next((i for i, s in enumerate(shortcuts) if s["name"] == name), None)
             if existing is not None:
                 shortcuts[existing]["command"] = command
-                shortcut_status_label.config(text=f"Atalho '{name}' atualizado!", fg="#1565c0")
+                shortcut_status_label.config(text=f"Atalho '{name}' atualizado!", fg=ACCENT_BLUE)
             else:
                 shortcuts.append({"name": name, "command": command})
-                shortcut_status_label.config(text=f"Atalho '{name}' adicionado!", fg="#2e7d32")
+                shortcut_status_label.config(text=f"Atalho '{name}' adicionado!", fg=COLOR_OK)
             _save_shortcuts(shortcuts)
             refresh_shortcuts()
             shortcut_name_entry.delete(0, tk.END)
@@ -1624,7 +1778,7 @@ def start_ui(hostname: str):
             """Remove o atalho selecionado."""
             sel = shortcut_listbox.curselection()
             if not sel:
-                shortcut_status_label.config(text="Selecione um atalho para remover", fg="orange")
+                shortcut_status_label.config(text="Selecione um atalho para remover", fg=COLOR_WARN)
                 return
             idx = sel[0]
             shortcuts = _load_shortcuts()
@@ -1635,17 +1789,23 @@ def start_ui(hostname: str):
                 refresh_shortcuts()
                 log.info("Atalho removido: %s", name)
 
-        shortcut_btn_frame = tk.Frame(shortcut_frame)
-        shortcut_btn_frame.pack(pady=(2, 0))
-        tk.Button(shortcut_btn_frame, text="Adicionar", command=add_shortcut, font=("Sans", 9)).pack(side="left", padx=3)
-        tk.Button(shortcut_btn_frame, text="Remover", command=remove_shortcut, font=("Sans", 9)).pack(side="left", padx=3)
-        tk.Button(shortcut_btn_frame, text="Atualizar", command=refresh_shortcuts, font=("Sans", 9)).pack(side="left", padx=3)
+        shortcut_btn_frame = tk.Frame(tab_shortcuts, bg=BG_CARD)
+        shortcut_btn_frame.pack(pady=(6, 0), fill="x")
+        _flat_button(shortcut_btn_frame, "Adicionar", add_shortcut, accent=True).pack(side="left", padx=(0, 6))
+        _flat_button(shortcut_btn_frame, "Remover", remove_shortcut).pack(side="left", padx=(0, 6))
+        _flat_button(shortcut_btn_frame, "Atualizar", refresh_shortcuts).pack(side="left")
 
         # Carrega atalhos iniciais
         refresh_shortcuts()
 
-        usb_label = tk.Label(root, text="Cabo USB: verificando...", fg="gray", font=("Sans", 9))
-        usb_label.pack(pady=(8, 0))
+        # --- Aba: Sistema ---
+        _section_label(tab_system, "Status")
+
+        usb_label = tk.Label(
+            tab_system, text="Cabo USB: verificando...", font=("Sans", 9),
+            bg=BG_CARD, fg=FG_MUTED, anchor="w",
+        )
+        usb_label.pack(fill="x", pady=(0, 12))
 
         def poll_usb():
             text, color = USB_STATUS_LABELS.get(STATE.usb_status, USB_STATUS_LABELS["checking"])
@@ -1654,16 +1814,17 @@ def start_ui(hostname: str):
 
         poll_usb()
 
-        btn_frame = tk.Frame(root)
-        btn_frame.pack(pady=(12, 0))
-        tk.Button(btn_frame, text="Ver terminal", command=open_log_viewer).pack(side="left", padx=5)
-        tk.Button(
-            btn_frame, text="Encerrar servidor", command=shutdown,
-            fg="white", bg="#b91c1c",
-        ).pack(side="left", padx=5)
+        _section_label(tab_system, "Diagnóstico")
+        _flat_button(tab_system, "Ver terminal", open_log_viewer).pack(fill="x", pady=(0, 16))
 
-        tk.Label(root, text=f"Rede local, porta {PORT}", fg="gray").pack(pady=(10, 0))
-        tk.Label(root, text="Sem PIN, ninguém conecta.", fg="gray").pack()
+        _section_label(tab_system, "Rede")
+        _hint_label(tab_system, f"Rede local, porta {PORT}").pack(fill="x")
+        _hint_label(tab_system, "Sem PIN, ninguém conecta.").pack(fill="x")
+
+        # ================= Rodapé (fixo, sempre visível) =================
+        footer = tk.Frame(root, bg=BG_MAIN)
+        footer.pack(fill="x", pady=(0, 12))
+        _flat_button(footer, "Encerrar servidor", shutdown, danger=True).pack()
 
         root.mainloop()
 
