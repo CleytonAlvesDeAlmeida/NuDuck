@@ -1564,6 +1564,21 @@ def start_ui(hostname: str):
         shortcut_listbox.pack(side="left", fill="both", expand=True)
         shortcut_scrollbar.pack(side="right", fill="y")
 
+        # --- Entrada de atalhos: duas caixas de texto direto na janela ---
+        entry_frame = tk.Frame(shortcut_frame)
+        entry_frame.pack(fill="x", pady=(4, 2))
+
+        tk.Label(entry_frame, text="Nome:", font=("Sans", 9)).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        shortcut_name_entry = tk.Entry(entry_frame, font=("Consolas", 10), width=25)
+        shortcut_name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        tk.Label(entry_frame, text="Comando:", font=("Sans", 9)).grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
+        shortcut_cmd_entry = tk.Entry(entry_frame, font=("Consolas", 10), width=25)
+        shortcut_cmd_entry.insert(0, "DISPLAY=:1 firefox &")
+        shortcut_cmd_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(4, 0))
+
+        entry_frame.columnconfigure(1, weight=1)
+
         shortcut_status_label = tk.Label(
             shortcut_frame, text="Nenhum atalho definido",
             font=("Sans", 8), fg="gray",
@@ -1583,41 +1598,27 @@ def start_ui(hostname: str):
             )
 
         def add_shortcut():
-            """Abre dialog para adicionar atalho."""
-            dialog = tk.Toplevel(root)
-            dialog.title("Novo Atalho")
-            dialog.geometry("400x180")
-            dialog.resizable(False, False)
-            dialog.transient(root)
-            dialog.grab_set()
-
-            tk.Label(dialog, text="Nome do atalho:", font=("Sans", 10)).pack(pady=(12, 2), padx=15, anchor="w")
-            name_entry = tk.Entry(dialog, font=("Consolas", 10))
-            name_entry.pack(fill="x", padx=15)
-            name_entry.focus_set()
-
-            tk.Label(dialog, text="Comando (será executado no display virtual):", font=("Sans", 10)).pack(pady=(8, 2), padx=15, anchor="w")
-            cmd_entry = tk.Entry(dialog, font=("Consolas", 10))
-            cmd_entry.pack(fill="x", padx=15)
-
-            def save():
-                name = name_entry.get().strip()
-                command = cmd_entry.get().strip()
-                if not name or not command:
-                    shortcut_status_label.config(text="Nome e comando são obrigatórios!", fg="orange")
-                    return
-                shortcuts = _load_shortcuts()
-                existing = next((i for i, s in enumerate(shortcuts) if s["name"] == name), None)
-                if existing is not None:
-                    shortcuts[existing]["command"] = command
-                else:
-                    shortcuts.append({"name": name, "command": command})
-                _save_shortcuts(shortcuts)
-                refresh_shortcuts()
-                dialog.destroy()
-                log.info("Atalho adicionado/editado: %s", name)
-
-            tk.Button(dialog, text="Salvar", command=save, font=("Sans", 10)).pack(pady=12)
+            """Adiciona atalho usando as caixas de texto da janela principal."""
+            name = shortcut_name_entry.get().strip()
+            command = shortcut_cmd_entry.get().strip()
+            if not name or not command:
+                shortcut_status_label.config(text="Nome e comando são obrigatórios!", fg="orange")
+                return
+            shortcuts = _load_shortcuts()
+            existing = next((i for i, s in enumerate(shortcuts) if s["name"] == name), None)
+            if existing is not None:
+                shortcuts[existing]["command"] = command
+                shortcut_status_label.config(text=f"Atalho '{name}' atualizado!", fg="#1565c0")
+            else:
+                shortcuts.append({"name": name, "command": command})
+                shortcut_status_label.config(text=f"Atalho '{name}' adicionado!", fg="#2e7d32")
+            _save_shortcuts(shortcuts)
+            refresh_shortcuts()
+            shortcut_name_entry.delete(0, tk.END)
+            shortcut_cmd_entry.delete(0, tk.END)
+            shortcut_cmd_entry.insert(0, "DISPLAY=:1 firefox &")
+            shortcut_name_entry.focus_set()
+            log.info("Atalho adicionado/editado: %s", name)
 
         def remove_shortcut():
             """Remove o atalho selecionado."""

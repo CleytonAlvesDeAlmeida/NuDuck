@@ -16,6 +16,7 @@ NuDuck/
 ├── server/
 │   ├── server.py            # Servidor principal (roda no PC)
 │   ├── virtual_display.py   # Display virtual Xvfb (modo Estender)
+│   ├── shortcuts.json       # Atalhos personalizados (modo Estender)
 │   └── requirements.txt     # Dependências Python
 └── android/                 # App Android (Kotlin + Compose)
 ```
@@ -118,6 +119,61 @@ DISPLAY=:1 xterm &
 
 Toques no celular viram cliques no display virtual (via xdotool).
 
+### Menu flutuante (dentro da transmissão)
+
+Enquanto a tela do PC é exibida no celular, um menu flutuante oferece
+controle rápido sem precisar desconectar:
+
+#### Botão "Modo"
+
+Abre um submenu com duas opções que alteram o modo de exibição
+**instantaneamente**, sem precisar voltar à tela inicial do app:
+
+- **Espelhar** — o celular passa a repetir a tela do PC (tela :0).
+- **Estender** — o celular vira a segunda tela virtual (tela :1).
+
+A troca é feita via sinalização WebSocket — o servidor reconfigura
+a fonte de vídeo e o display virtual automaticamente.
+
+#### Botão "Atalhos" (modo Estender)
+
+Abre um submenu com atalhos personalizados definidos no servidor.
+Cada atalho tem um **nome** visível (ex: "Abrir Firefox") e um **comando**
+associado que é executado no display virtual (`DISPLAY=:1`).
+
+O celular mostra apenas o **nome**; ao tocar, o comando é enviado ao
+servidor e executado na tela virtual. Exemplo de uso:
+
+```json
+// server/shortcuts.json
+{
+  "shortcuts": [
+    {"name": "Abrir Firefox", "command": "DISPLAY=:1 firefox &"},
+    {"name": "Terminal", "command": "DISPLAY=:1 xterm &"},
+    {"name": "Navegador de arquivos", "command": "DISPLAY=:1 pcmanfm &"}
+  ]
+}
+```
+
+Edite o arquivo `server/shortcuts.json` para criar seus próprios atalhos.
+As alterações são lidas automaticamente pelo servidor — não precisa
+reiniciar.
+
+### Rotação automática de resolução (modo Estender)
+
+Quando o celular é rotacionado (retrato ↔ paisagem), o servidor
+detecta a mudança de orientação e **reinicia o Xvfb automaticamente**
+com a resolução correspondente ao novo formato. Isso significa que
+o desktop virtual se adapta à tela do celular sem intervenção manual.
+
+Resoluções padrão:
+- **Paisagem:** largura > altura (ex: 1280×720)
+- **Retrato:** altura > largura (ex: 720×1280)
+
+O ajuste é feito via mensagem de sinalização WebSocket — o celular
+envia a nova orientação e o servidor reconfigura o display virtual
+em tempo real.
+
 ## Protocolo de sinalização (WebSocket, porta 8765)
 
 ```
@@ -130,6 +186,13 @@ PC -> Celular   {"type":"answer","sdp":"...","sdpType":"answer","mode":"mirror"}
 Celular -> PC   {"type":"quality","value":"720p"}
 Celular -> PC   {"type":"tap","x":0.5,"y":0.5}
 Celular -> PC   {"type":"key","key":"enter"}
+
+# Novas mensagens (menu flutuante e rotação)
+Celular -> PC   {"type":"switch_mode","mode":"mirror"}  ou  {"type":"switch_mode","mode":"extend"}
+Celular -> PC   {"type":"run_shortcut","command":"DISPLAY=:1 firefox &"}
+Celular -> PC   {"type":"rotation","orientation":"portrait"}  ou  {"type":"rotation","orientation":"landscape"}
+PC -> Celular   {"type":"shortcuts_list","shortcuts":[{"name":"Abrir Firefox","command":"..."},...]}
+PC -> Celular   {"type":"mode_changed","mode":"extend"}
 ```
 
 ## Dicas de performance (PC ou celular fracos)
@@ -167,6 +230,20 @@ qualidades baixas). Além disso:
 - Nada sai da rede local — sem nuvem, sem telemetria.
 
 ## Changelog
+
+### Atualização (29/07/2026)
+- **Novo: Botão "Modo" no menu flutuante** — permite trocar entre
+  Espelhar e Estender instantaneamente durante a transmissão, sem
+  voltar à tela inicial do app.
+- **Novo: Botão "Atalhos" no menu flutuante** — no modo Estender,
+  exibe atalhos personalizados definidos em `server/shortcuts.json`.
+  Cada atalho tem um nome visível no celular e um comando que é
+  executado no display virtual ao tocar.
+- **Novo: Rotação automática de resolução** — ao rotacionar o celular
+  no modo Estender, o Xvfb reinicia automaticamente com a resolução
+  correspondente ao novo formato (retrato/paisagem).
+- **Novo:** arquivo `server/shortcuts.json` para configuração de
+  atalhos personalizados do display virtual.
 
 ### Atualização (27/07/2026)
 - **Corrigido:** botão "Via cabo (USB)" não conectava quando o celular
