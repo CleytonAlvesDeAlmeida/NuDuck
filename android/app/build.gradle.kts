@@ -13,11 +13,25 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        // Celular real usa processador ARM (arm64-v8a nos aparelhos atuais,
+        // armeabi-v7a nos mais antigos). As variantes x86/x86_64 só existem
+        // pra rodar em emulador de PC — mas a biblioteca nativa do WebRTC é
+        // a peça mais pesada do app, e por padrão o Gradle empacota as 4
+        // variantes juntas. Restringindo pra só ARM, o APK final fica bem
+        // mais enxuto sem tirar nenhuma função pra quem usa celular de verdade.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Remove código/recursos não usados e ofusca o que sobra —
+            // isso já estava desligado (isMinifyEnabled = false), então o
+            // build de release nunca chegou a ficar menor que o de debug.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
