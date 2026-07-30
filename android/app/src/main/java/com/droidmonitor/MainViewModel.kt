@@ -233,8 +233,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
             val hostPort = try {
+                val paddedLen = (sub[0].length + 3) / 4 * 4
                 String(android.util.Base64.decode(
-                    sub[0].padEnd((sub[0].length + 3) and.inv(3), '='),
+                    sub[0].padEnd(paddedLen, '='),
                     android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP,
                 ), Charsets.UTF_8)
             } catch (_: Exception) {

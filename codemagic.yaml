@@ -54,15 +54,39 @@ workflows:
   #   - O round-trip do token QR criptografado funciona (gera → valida → OK)
   #   - Um token expirado é corretamente rejeitado
   #   - A geração de atalhos padrão (Item 1) produz os 3 atalhos esperados
+  #
+  # Nota: o bloco `environment` do Codemagic NÃO suporta `python` como campo
+  # de versão (só aceita java/node/flutter/xcode/cocoapods/vars/groups).
+  # Por isso, o Python 3 é instalado explicitamente via apt-get no primeiro
+  # script. O Linux instance do Codemagic já vem com python3 pré-instalado,
+  # mas garantimos a versão e o pip.
   # ----------------------------------------------------------------------
   server-validate:
     name: Validar Server Python (QR criptografado + atalhos + sintaxe)
     max_build_duration: 30
     instance_type: linux
     environment:
-      python: 3.11
+      vars:
+        PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        PIP_NO_CACHE_DIR: "1"
     scripts:
-      - name: Instalar cryptography (Item 3) e Pillow
+      - name: Garantir Python 3 e pip disponíveis
+        script: |
+          # O Linux instance do Codemagic já vem com python3; só garantimos
+          # que pip e venv estão disponíveis. Se python3 não existir, instala.
+          if ! command -v python3 >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y python3 python3-pip python3-venv
+          fi
+          python3 --version
+          python3 -m pip --version || (
+            sudo apt-get update -y
+            sudo apt-get install -y python3-pip
+          )
+          # Alias `python` -> `python3` (algumas distros Linux não criam o alias).
+          command -v python >/dev/null 2>&1 || sudo ln -sf "$(which python3)" /usr/local/bin/python
+
+      - name: Instalar cryptography (Item 3)
         script: |
           cd server
           python -m pip install --upgrade pip
@@ -71,7 +95,7 @@ workflows:
           # nativas que nem sempre estão disponíveis em runners headless —
           # sua validação acontece no workflow .github/workflows/build-desktop.yml
           # (que roda em Ubuntu/Windows com libs de sistema completas).
-          pip install cryptography>=42
+          pip install "cryptography>=42"
 
       - name: Verificar sintaxe Python (ast.parse)
         script: |
