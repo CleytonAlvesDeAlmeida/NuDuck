@@ -217,7 +217,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         // ---- Item 7: formato novo (token criptografado ND1) ----
         if (rawValue.startsWith("ND1.")) {
-            val parts = rawValue.split(".", 2)
+            val parts = rawValue.split(".", limit = 2)
             if (parts.size != 2) {
                 _uiState.update {
                     it.copy(screen = Screen.ConnectionError(app.getString(R.string.qr_invalid)))
