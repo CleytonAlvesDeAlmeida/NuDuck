@@ -1889,11 +1889,20 @@ def start_ui(hostname: str):
             win.geometry(f"{log_w}x{log_h}")
             win.minsize(sc(360), sc(240))
 
-            text = scrolledtext.ScrolledText(
-                win, bg="#0b0b0b", fg="#e6e6e6", insertbackground="#e6e6e6",
-                font=("Consolas", 9), borderwidth=0,
+            term_frame = tk.Frame(win, bg="#0b0b0b")
+            term_frame.pack(fill="both", expand=True)
+            term_scroll = tk.Scrollbar(
+                term_frame, orient="vertical",
+                bg="#ffffff", troughcolor="#333333", activebackground="#cccccc",
+                borderwidth=0, highlightthickness=0,
             )
-            text.pack(fill="both", expand=True)
+            text = tk.Text(
+                term_frame, bg="#0b0b0b", fg="#e6e6e6", insertbackground="#e6e6e6",
+                font=("Consolas", 9), borderwidth=0, yscrollcommand=term_scroll.set,
+            )
+            term_scroll.configure(command=text.yview)
+            term_scroll.pack(side="right", fill="y")
+            text.pack(side="left", fill="both", expand=True)
             text.configure(state="disabled")
 
             def poll_logs():
@@ -1994,8 +2003,8 @@ def start_ui(hostname: str):
             canvas = tk.Canvas(outer, bg=bg, highlightthickness=0, borderwidth=0)
             vsb = tk.Scrollbar(
                 outer, orient="vertical", command=canvas.yview,
-                bg=ACCENT_BLUE_DK, troughcolor=BG_SURFACE,
-                activebackground=ACCENT_BLUE, borderwidth=0,
+                bg="#ffffff", troughcolor="#333333",
+                activebackground="#cccccc", borderwidth=0,
                 highlightthickness=0, width=12,
             )
             inner = tk.Frame(canvas, bg=bg, padx=14, pady=14)
@@ -2156,7 +2165,7 @@ def start_ui(hostname: str):
         )
         shortcut_scrollbar = tk.Scrollbar(
             shortcut_listbox_frame, orient="vertical", command=shortcut_listbox.yview,
-            bg=BG_CARD, troughcolor=BG_FIELD, activebackground=ACCENT_BLUE_DK,
+            bg="#ffffff", troughcolor="#333333", activebackground="#cccccc",
             borderwidth=0, highlightthickness=0, width=10,
         )
         shortcut_listbox.configure(yscrollcommand=shortcut_scrollbar.set)

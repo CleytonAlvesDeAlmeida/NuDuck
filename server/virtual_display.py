@@ -168,19 +168,6 @@ class XvfbVirtualDisplay:
         # abaixo (precisa de uma janela já mapeada no display).
         self._start_x2x()
 
-        # Popen não espera a janela do terminal realmente abrir/mapear no X —
-        # uma pausa curta garante que ela já existe antes de clonar o tema.
-        time.sleep(0.6)
-
-        # Clona aparência do display principal (:0) para o display virtual (:N).
-        # Replica tema GTK, ícones, fonte, cursor, papel de parede e variante
-        # de cor — sem isso, o display digital fica com fundo sólido e tema
-        # padrão, parecendo bem diferente do monitor principal.
-        # Roda depois do terminal abrir (não antes): alguns WMs/temas só
-        # aplicam a aparência corretamente depois que já existe pelo menos
-        # uma janela no display para "ancorar" a sessão gráfica.
-        self._clone_display0_appearance()
-
         # Inicia captura (thread, não processo — sem leak de memória compartilhada)
         self._start_capture_thread()
 
@@ -1137,9 +1124,9 @@ root.mainloop()
         # display que não existe mais).
         self._start_x2x()
 
-        # Reaplica aparência do display0 no Xvfb recém-recriado (rotação).
-        # Roda depois do terminal abrir, mesmo motivo do start() inicial.
-        self._clone_display0_appearance()
+        # Clonagem automática de aparência removida no resize — use o
+        # botão "Clonar aparência para o Display 2" na aba Sistema.
+        # self._clone_display0_appearance()
 
         # Reinicia captura
         self._start_capture_thread()
