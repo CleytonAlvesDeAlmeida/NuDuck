@@ -2273,6 +2273,128 @@ def start_ui(hostname: str):
         _section_label(tab_system, "Diagnóstico")
         _flat_button(tab_system, "Ver terminal", open_log_viewer).pack(fill="x", pady=(0, 16))
 
+        _section_label(tab_system, "Aparência do Display 2")
+        appearance_status_label = _hint_label(
+            tab_system, "Clona tema/ícones/papel de parede do display principal para o Display 2 (Estender)."
+        )
+
+        def _clone_appearance_now():
+            """Roda a clonagem de aparência sob demanda (item pedido: botão
+            manual, já que a versão 100% automática no início do Estender
+            nem sempre pega dependendo do ambiente gráfico do PC).
+
+            Faz 3 coisas, nessa ordem:
+              1. Reaplica a lógica já existente (dconf/gsettings por chave +
+                 papel de parede via feh) — é a mesma que roda sozinha ao
+                 iniciar o Estender, aqui repetida sob demanda.
+              2. Roda literalmente os comandos do arquivo enviado: dump
+                 completo do schema org.gnome.desktop.interface no display
+                 principal (:0) e load desse dump no Display 2.
+                 Aviso técnico: dconf é uma configuração por usuário, não
+                 por DISPLAY — então esse dump/load tende a não mudar nada
+                 sozinho (a config já é a mesma pros dois displays). Incluído
+                 mesmo assim porque foi pedido explicitamente e não faz mal.
+              3. Se houver xfce4-panel ou gnome-shell instalado, inicia um
+                 painel leve no Display 2 (só se ainda não tiver um rodando).
+                 Atenção: gnome-shell é pesado e pode falhar/travar num
+                 Xvfb sem aceleração de GPU — se isso acontecer, o Display 2
+                 continua funcionando normalmente, só o painel não aparece.
+            """
+            appearance_status_label.config(text="Executando…", fg=FG_MUTED)
+
+            def _work():
+                vd = get_active_display()
+                if not vd or not vd.is_running() or not vd.display_name:
+                    root.after(0, lambda: appearance_status_label.config(
+                        text="Ative o modo Estender primeiro (é preciso ter um Display 2 rodando).",
+                        fg=COLOR_WARN,
+                    ))
+                    return
+
+                display_n = vd.display_name
+                results = []
+                env_n = vd._build_session_env(display_n)
+
+                # 1) Reaplica a lógica já existente (mais robusta: dconf +
+                #    gsettings + papel de parede via feh + fallback de cor).
+                try:
+                    vd._clone_display0_appearance()
+                    results.append("tema/papel de parede reaplicados")
+                except Exception as exc:
+                    results.append(f"falha ao reaplicar tema ({exc})")
+
+                # 2) Comandos do arquivo enviado: dump/load do dconf.
+                try:
+                    env0 = vd._build_session_env(":0")
+                    dump = subprocess.run(
+                        ["dconf", "dump", "/org/gnome/desktop/interface/"],
+                        env=env0, capture_output=True, timeout=5,
+                    )
+                    if dump.returncode == 0 and dump.stdout:
+                        load = subprocess.run(
+                            ["dconf", "load", "/org/gnome/desktop/interface/"],
+                            input=dump.stdout, env=env_n, capture_output=True, timeout=5,
+                        )
+                        if load.returncode == 0:
+                            results.append("dconf dump/load ok")
+                        else:
+                            err = load.stderr.decode(errors="ignore").strip()
+                            results.append(f"dconf load falhou ({err or 'sem detalhe'})")
+                    else:
+                        err = dump.stderr.decode(errors="ignore").strip()
+                        results.append(f"dconf dump vazio/falhou ({err or 'sem detalhe'})")
+                except FileNotFoundError:
+                    results.append("dconf não instalado (sudo apt install dconf-cli)")
+                except Exception as exc:
+                    results.append(f"erro no dconf dump/load ({exc})")
+
+                # 3) Painel leve no Display 2, se disponível e ainda não
+                #    estiver rodando (evita empilhar processo a cada clique).
+                try:
+                    already_running = any(
+                        "xfce4-panel" in " ".join(p.get("cmd", [])) or "gnome-shell" in " ".join(p.get("cmd", []))
+                        for p in getattr(vd, "_extra_panel_procs", [])
+                    )
+                except Exception:
+                    already_running = False
+
+                if not already_running:
+                    try:
+                        if shutil.which("xfce4-panel"):
+                            proc = subprocess.Popen(
+                                ["xfce4-panel"], env=env_n,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            )
+                            vd._extra_panel_procs = getattr(vd, "_extra_panel_procs", []) + [
+                                {"proc": proc, "cmd": ["xfce4-panel"]}
+                            ]
+                            results.append("xfce4-panel iniciado no Display 2")
+                        elif shutil.which("gnome-shell"):
+                            proc = subprocess.Popen(
+                                ["gnome-shell", "--replace"], env=env_n,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            )
+                            vd._extra_panel_procs = getattr(vd, "_extra_panel_procs", []) + [
+                                {"proc": proc, "cmd": ["gnome-shell", "--replace"]}
+                            ]
+                            results.append("gnome-shell --replace iniciado no Display 2 (pode falhar sem GPU)")
+                    except Exception as exc:
+                        results.append(f"painel/shell não iniciado ({exc})")
+
+                msg = "; ".join(results)
+                root.after(0, lambda: appearance_status_label.config(text=msg, fg=COLOR_OK))
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        _flat_button(tab_system, "Clonar aparência para o Display 2", _clone_appearance_now, accent=True).pack(
+            fill="x", pady=(6, 4)
+        )
+        _hint_label(
+            tab_system,
+            "Também roda os comandos do arquivo: dump/load do dconf e painel leve "
+            "(xfce4-panel ou gnome-shell) no Display 2, quando disponíveis.",
+        )
+
         _section_label(tab_system, "Rede")
         _hint_label(tab_system, f"Rede local, porta {PORT}").pack(fill="x")
         _hint_label(tab_system, "Sem PIN, ninguém conecta.").pack(fill="x")
