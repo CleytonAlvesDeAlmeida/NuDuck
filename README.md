@@ -27,7 +27,7 @@ NuDuck/
 
 ```bash
 # Debian/Ubuntu
-sudo apt install python3-tk xvfb xdotool openbox x11-xserver-utils x11-apps xterm
+sudo apt install python3-tk xvfb xdotool openbox x11-xserver-utils x11-apps xterm x2x feh dconf-cli
 
 # Fedora
 sudo dnf install python3-tkinter xorg-x11-server-Xvfb xdotool openbox xorg-x11-server-utils xorg-x11-apps xterm

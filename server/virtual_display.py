@@ -5,7 +5,7 @@ Funciona igual ao SpaceDesk: cria um servidor X separado (Xvfb) que o
 celular renderiza e controla, funcionando como uma segunda tela virtual.
 
 Requisitos:
-  sudo apt install xvfb xdotool openbox x11-xserver-utils x11-apps xterm
+  sudo apt install xvfb xdotool openbox x11-xserver-utils x11-apps xterm x2x feh dconf-cli
 
 Nota: pacotes chamados "xsetroot" ou "x11-utils" NÃO existem no apt para
 esse fim (xsetroot vem dentro de x11-xserver-utils, e xwd vem dentro de
@@ -65,6 +65,7 @@ class XvfbVirtualDisplay:
         self.display_name = None
         self.xvfb_process = None
         self.wm_process = None
+        self._x2x_process = None
         # Captura via thread (evita leak de memória compartilhada do multiprocessing)
         self._capture_thread = None
         self._stop_event = None
@@ -158,14 +159,27 @@ class XvfbVirtualDisplay:
         if not self._wm_name:
             log.warning("Nenhum WM encontrado. Instale openbox.")
 
+        # Abre um terminal automaticamente no display virtual
+        self._open_initial_terminal(env)
+
+        # Ativa o x2x assim que o terminal abre: mouse/teclado passam a
+        # atravessar pro Display 2 pela borda direita da tela. Roda logo
+        # depois do terminal existir, mesma lógica do clone de aparência
+        # abaixo (precisa de uma janela já mapeada no display).
+        self._start_x2x()
+
+        # Popen não espera a janela do terminal realmente abrir/mapear no X —
+        # uma pausa curta garante que ela já existe antes de clonar o tema.
+        time.sleep(0.6)
+
         # Clona aparência do display principal (:0) para o display virtual (:N).
         # Replica tema GTK, ícones, fonte, cursor, papel de parede e variante
         # de cor — sem isso, o display digital fica com fundo sólido e tema
         # padrão, parecendo bem diferente do monitor principal.
+        # Roda depois do terminal abrir (não antes): alguns WMs/temas só
+        # aplicam a aparência corretamente depois que já existe pelo menos
+        # uma janela no display para "ancorar" a sessão gráfica.
         self._clone_display0_appearance()
-
-        # Abre um terminal automaticamente no display virtual
-        self._open_initial_terminal(env)
 
         # Inicia captura (thread, não processo — sem leak de memória compartilhada)
         self._start_capture_thread()
@@ -192,6 +206,58 @@ class XvfbVirtualDisplay:
             ),
         }
         return True, self.display_name, info
+
+    def _start_x2x(self):
+        """Ativa o x2x: deixa o mouse/teclado do PC "atravessar" para o
+        display virtual quando o cursor é levado até a borda direita
+        ("east") do monitor principal — como se o Display 2 fosse um
+        monitor físico a mais, sem precisar clicar em nada.
+
+        Roda no display principal (:0) apontando para o display virtual
+        (`-to <display_name>`), então precisa ser reiniciado sempre que o
+        display virtual for recriado (resize/rotação) e ser parado ao sair
+        do Estender — senão o cursor continuaria "vazando" pra um display
+        que não existe mais.
+        """
+        if not shutil.which("x2x"):
+            log.warning(
+                "x2x não está instalado — mouse/teclado não vão atravessar "
+                "automaticamente para o Display 2. Instale: sudo apt install x2x"
+            )
+            return
+        if self._x2x_process and self._x2x_process.poll() is None:
+            # Já tem uma instância rodando (ex.: resize sem stop antes) —
+            # mata antes de subir outra, senão duas instâncias disputam o
+            # mesmo par de displays.
+            self._stop_x2x()
+        try:
+            env0 = self._build_session_env(":0")
+            self._x2x_process = subprocess.Popen(
+                ["x2x", "-east", "-to", self.display_name],
+                env=env0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            log.info(
+                "x2x ativado: mouse/teclado atravessam para %s pela borda direita da tela.",
+                self.display_name,
+            )
+        except Exception as exc:
+            log.warning("Erro ao iniciar x2x: %s", exc)
+
+    def _stop_x2x(self):
+        """Encerra o x2x — chamado ao sair do Estender, pra o cursor voltar
+        a ficar preso no display principal em vez de continuar tentando
+        atravessar para um display que não existe mais."""
+        if self._x2x_process:
+            try:
+                self._x2x_process.terminate()
+                self._x2x_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self._x2x_process.kill()
+                except Exception:
+                    pass
+            self._x2x_process = None
+            log.info("x2x encerrado.")
 
     def _remove_stale_files(self, lock_file, socket_file):
         """Remove arquivos de lock/socket de Xvfb que morreu."""
@@ -871,6 +937,11 @@ root.mainloop()
         if self._stop_event:
             self._stop_event.set()
 
+        # Encerra o x2x — sem isso o cursor continuaria "vazando" pela
+        # borda direita da tela tentando ir pra um display que não existe
+        # mais assim que o Estender for desligado.
+        self._stop_x2x()
+
         # Espera thread terminar
         if self._capture_thread and self._capture_thread.is_alive():
             self._capture_thread.join(timeout=3)
@@ -1058,11 +1129,17 @@ root.mainloop()
                 except Exception:
                     continue
 
-        # Reaplica aparência do display0 no Xvfb recém-recriado (rotação).
-        self._clone_display0_appearance()
-
         # Abre terminal inicial
         self._open_initial_terminal(env)
+
+        # Reinicia o x2x (o display virtual foi recriado, então o x2x
+        # antigo, se ainda estivesse rodando, estaria apontando pra um
+        # display que não existe mais).
+        self._start_x2x()
+
+        # Reaplica aparência do display0 no Xvfb recém-recriado (rotação).
+        # Roda depois do terminal abrir, mesmo motivo do start() inicial.
+        self._clone_display0_appearance()
 
         # Reinicia captura
         self._start_capture_thread()
