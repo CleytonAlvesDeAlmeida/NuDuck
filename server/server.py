@@ -664,55 +664,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
         return canvas
 
-    def _crop_to_phone_aspect(self, frame_bgr, phone_w: int, phone_h: int):
-        """Item 6: Recorta a região central do frame BGR para casar o aspect
-        ratio do celular.
-
-        No modo Espelhar, o monitor do PC é tipicamente 16:9 (1920x1080) e
-        o celular em paisagem tem aspect ~2.2:1 (2400x1080). Sem este crop,
-        o `_letterbox` adiciona barras pretas laterais — visualmente fica
-        "tela quadrada na horizontal". Com o crop, recortamos a faixa
-        central do monitor (perdendo ~10% da altura) que tem o mesmo aspect
-        do celular; assim o `_letterbox` faz early-return e o vídeo
-        preenche a tela do celular sem barras.
-
-        Equivalente a "zoom to fill" preservando o centro — melhor para
-        espelhamento onde ver a tela inteira com barras é pior do que ver
-        90% preenchendo tudo.
-
-        Parâmetros:
-            frame_bgr: numpy array BGR (H, W, 3) da captura do monitor.
-            phone_w, phone_h: dimensões da tela do celular (pixels).
-
-        Retorna: numpy array BGR recortado (H', W', 3).
-        """
-        if phone_w <= 0 or phone_h <= 0:
-            return frame_bgr
-
-        src_h, src_w = frame_bgr.shape[:2]
-        if src_w <= 0 or src_h <= 0:
-            return frame_bgr
-
-        phone_aspect = phone_w / phone_h
-        src_aspect = src_w / src_h
-
-        # Se aspects já são próximos (< 2% de diferença), não precisa crop.
-        if abs(src_aspect - phone_aspect) < 0.02:
-            return frame_bgr
-
-        if src_aspect > phone_aspect:
-            # Monitor é "mais largo" que o celular (ex.: 16:9 vs 2.2:1).
-            # Corta laterais para reduzir a largura.
-            new_w = int(src_h * phone_aspect)
-            x_offset = (src_w - new_w) // 2
-            return frame_bgr[:, x_offset:x_offset + new_w]
-        else:
-            # Monitor é "mais alto" que o celular (raro, mas possível em
-            # celular em retrato com monitor em paisagem). Corta topo/base.
-            new_h = int(src_w / phone_aspect)
-            y_offset = (src_h - new_h) // 2
-            return frame_bgr[y_offset:y_offset + new_h, :]
-
     def _resample_filter(self, target_h: int) -> int:
         """Filtro de reamostragem: NEAREST (mais leve) para as qualidades mais
         baixas, onde a perda de nitidez é imperceptível e a economia de CPU
@@ -836,17 +787,13 @@ class ScreenCaptureTrack(VideoStreamTrack):
                     src_h, src_w = img.shape[:2]
                     log.debug("Janela recortada: %dx%d", src_w, src_h)
 
-        # --- Item 6: Crop centralizado para casar aspect ratio do celular ---
-        # No modo Espelhar, o monitor do PC é tipicamente 16:9 (1920x1080)
-        # enquanto o celular em paisagem tem aspect ~2.2:1 (2400x1080). Sem
-        # este crop, o `_letterbox` adiciona barras pretas laterais, dando a
-        # impressão de "tela quadrada" na horizontal. Com o crop, recortamos
-        # a região central do monitor que casa com o aspect do celular —
-        # equivalente a "zoom para preencher", mas preservando o centro.
-        if self._phone_w and self._phone_h and not STATE.window_mode:
-            img = self._crop_to_phone_aspect(img, self._phone_w, self._phone_h)
-            src_h, src_w = img.shape[:2]
-
+        # Item 6 (revisado): a versão anterior recortava a região central do
+        # monitor para "preencher" a tela do celular sem barras pretas — mas
+        # isso descartava uma fatia real da tela do PC (ex.: barra de tarefas,
+        # bordas de janelas), o que é pior do que ver a tela inteira com
+        # pequenas barras. Voltamos a nunca cortar: `_letterbox` abaixo
+        # sempre mostra o monitor inteiro, com barras pretas só quando o
+        # aspect ratio realmente não bate com o do celular.
         target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
         # Usa cv2.resize em BGR

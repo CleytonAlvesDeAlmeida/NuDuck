@@ -1,6 +1,8 @@
 package com.droidmonitor
 
+import android.app.Activity
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
@@ -54,6 +56,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -118,33 +121,67 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun DroidMonitorApp(viewModel: MainViewModel, windowSizeClass: WindowSizeClass) {
     val uiState by viewModel.uiState.collectAsState()
+    val context = LocalContext.current
+    val activity = context as? Activity
+
+    // Item 5 (revisado): o hint "Toque novamente para sair" já existia no
+    // ViewModel, mas nenhuma tela chegava a exibi-lo — o usuário nunca via
+    // feedback nenhum ao apertar Voltar. Mostra como Toast sempre que o
+    // ViewModel definir um hint, em qualquer tela.
+    LaunchedEffect(uiState.transientHint) {
+        val hint = uiState.transientHint
+        if (hint != null) {
+            Toast.makeText(context, hint, Toast.LENGTH_SHORT).show()
+            viewModel.clearTransientHint()
+        }
+    }
 
     when (val screen = uiState.screen) {
-        is Screen.Discovery -> DiscoveryScreen(
-            pcs = uiState.discoveredPcs,
-            windowSizeClass = windowSizeClass,
-            onPcSelected = viewModel::selectPc,
-            onQrScanRequested = viewModel::openQrScan,
-            onCableConnectRequested = viewModel::connectViaCable,
-            onSettingsRequested = viewModel::openSettings,
-        )
+        is Screen.Discovery -> {
+            // Item 5 (revisado): antes, Voltar na tela raiz saía do app
+            // direto no 1º toque (comportamento padrão do Android quando
+            // nenhum BackHandler consome o evento). Agora pede confirmação
+            // com "2 toques sai do app", igual ao resto do app.
+            BackHandler(enabled = true) {
+                viewModel.handleRootBack(onExit = { activity?.finish() })
+            }
+            DiscoveryScreen(
+                pcs = uiState.discoveredPcs,
+                windowSizeClass = windowSizeClass,
+                onPcSelected = viewModel::selectPc,
+                onQrScanRequested = viewModel::openQrScan,
+                onCableConnectRequested = viewModel::connectViaCable,
+                onSettingsRequested = viewModel::openSettings,
+            )
+        }
 
-        is Screen.QrScan -> QrScanScreen(
-            onScanned = viewModel::onQrCodeScanned,
-            onCancel = viewModel::cancelQrScan,
-        )
+        is Screen.QrScan -> {
+            BackHandler(enabled = true) { viewModel.cancelQrScan() }
+            QrScanScreen(
+                onScanned = viewModel::onQrCodeScanned,
+                onCancel = viewModel::cancelQrScan,
+            )
+        }
 
-        is Screen.PinEntry -> PinEntryScreen(
-            pc = screen.pc,
-            pinError = uiState.pinError,
-            prefilledPin = uiState.prefilledPin,
-            screenMode = uiState.screenMode,
-            onScreenModeChange = viewModel::setScreenMode,
-            onCancel = viewModel::cancelPinEntry,
-            onSubmit = { pin -> viewModel.submitPin(screen.pc, pin) },
-        )
+        is Screen.PinEntry -> {
+            BackHandler(enabled = true) { viewModel.cancelPinEntry() }
+            PinEntryScreen(
+                pc = screen.pc,
+                pinError = uiState.pinError,
+                prefilledPin = uiState.prefilledPin,
+                screenMode = uiState.screenMode,
+                onScreenModeChange = viewModel::setScreenMode,
+                onCancel = viewModel::cancelPinEntry,
+                onSubmit = { pin -> viewModel.submitPin(screen.pc, pin) },
+            )
+        }
 
-        is Screen.Connecting -> ConnectingScreen()
+        is Screen.Connecting -> {
+            // Permite cancelar uma conexão travada (ex.: token QR expirado
+            // no meio do handshake) em vez de ficar preso na tela.
+            BackHandler(enabled = true) { viewModel.disconnect() }
+            ConnectingScreen()
+        }
 
         is Screen.Connected -> ConnectedScreen(
             viewModel = viewModel,
@@ -159,16 +196,22 @@ fun DroidMonitorApp(viewModel: MainViewModel, windowSizeClass: WindowSizeClass) 
             connectedPc = uiState.connectedPc,
         )
 
-        is Screen.ConnectionError -> ConnectionErrorScreen(
-            message = screen.message,
-            onDismiss = viewModel::disconnect,
-        )
+        is Screen.ConnectionError -> {
+            BackHandler(enabled = true) { viewModel.disconnect() }
+            ConnectionErrorScreen(
+                message = screen.message,
+                onDismiss = viewModel::disconnect,
+            )
+        }
 
-        is Screen.Settings -> SettingsScreen(
-            settings = uiState.settings,
-            onSettingsChange = viewModel::updateSettings,
-            onClose = viewModel::closeSettings,
-        )
+        is Screen.Settings -> {
+            BackHandler(enabled = true) { viewModel.closeSettings() }
+            SettingsScreen(
+                settings = uiState.settings,
+                onSettingsChange = viewModel::updateSettings,
+                onClose = viewModel::closeSettings,
+            )
+        }
     }
 }
 

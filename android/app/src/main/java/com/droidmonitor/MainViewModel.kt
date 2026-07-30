@@ -100,6 +100,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var lastBackAt: Long = 0L
     private val DOUBLE_BACK_THRESHOLD_MS = 350L
 
+    // Timestamp do último toque no botão Voltar na tela raiz (Discovery,
+    // sem tela anterior pra voltar). Separado de [lastBackAt] pra não
+    // misturar com a lógica de ESC durante a transmissão. Janela maior
+    // (2s) porque aqui é só uma confirmação de saída, não uma ação
+    // repetida rapidamente durante controle remoto.
+    private var lastRootBackAt: Long = 0L
+    private val ROOT_DOUBLE_BACK_THRESHOLD_MS = 2000L
+
     // ---- Monitor de túnel USB (Item 8) ----
     // Detecta se o adb reverse está ativo em 127.0.0.1:8765. Se sim, qualquer
     // conexão QR é redirecionada para o cabo (ignora o IP do QRCode).
@@ -268,15 +276,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 host = effectiveHost,
                 port = effectivePort,
             )
-            // O token criptografado é guardado em memória e reenviado no handshake.
+            // Conecta direto, sem passar pela tela de PIN: o token já
+            // autentica sozinho (o server valida no lugar do PIN). Pedir um
+            // PIN de 6 dígitos aqui só confundia o usuário (o campo ficava
+            // vazio e o botão "Conectar" desabilitado) e ainda desperdiçava
+            // parte da janela de 30s de validade do token com o usuário
+            // parado numa tela esperando digitar algo que não era necessário.
             _uiState.update {
                 it.copy(
-                    screen = Screen.PinEntry(pc),
-                    prefilledPin = "",
-                    transientHint = if (viaUsb) "Conectando via cabo (USB)" else null,
                     pendingQrToken = sub[1], // só o ciphertext (a parte cifrada)
+                    transientHint = if (viaUsb) "Conectando via cabo (USB)" else null,
                 )
             }
+            submitPin(pc, "")
             return
         }
 
@@ -600,6 +612,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Limpa o hint transitório (chamado pela UI depois de mostrar o Toast). */
     fun clearTransientHint() {
         _uiState.update { it.copy(transientHint = null) }
+    }
+
+    /**
+     * Lógica do botão Voltar na tela raiz (Discovery — não há tela anterior
+     * pra voltar, então "1 toque volta" não se aplica; só "2 toques sai do
+     * app" faz sentido aqui).
+     *
+     * - 1 toque: mostra o hint "Toque novamente para sair" (via Toast na UI).
+     * - 2 toques em <2s: chama [onExit] (a UI fecha a Activity).
+     */
+    fun handleRootBack(onExit: () -> Unit) {
+        val now = System.currentTimeMillis()
+        if (now - lastRootBackAt < ROOT_DOUBLE_BACK_THRESHOLD_MS) {
+            lastRootBackAt = 0L
+            _uiState.update { it.copy(transientHint = null) }
+            onExit()
+        } else {
+            lastRootBackAt = now
+            _uiState.update { it.copy(transientHint = "Toque novamente para sair") }
+        }
     }
 
     override fun onCleared() {
