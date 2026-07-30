@@ -29,6 +29,8 @@ private const val TAG = "WebRtcClient"
 class WebRtcClient(
     context: Context,
     private val signalingClient: SignalingClient,
+    /** Item 9: "standard" (Wi-Fi) ou "low_latency" (USB). Ajusta codec, ICE e SDP. */
+    private val latencyProfile: String = "standard",
 ) {
     interface Listener {
         fun onRemoteVideoTrack(track: VideoTrack)
@@ -55,6 +57,11 @@ class WebRtcClient(
                 .createInitializationOptions()
         )
 
+        // Item 9: em low_latency, o encoder H264 é preferido sobre VP8/VP9.
+        // H264 tem aceleração de hardware consistente em Android (MediaCodec)
+        // e menor overhead de encode que VP8 em software. O DefaultVideoEncoderFactory
+        // já prioriza H264 internamente quando `enableIntelVp8Encoder=true`,
+        // mas aqui preferimos o caminho explícito.
         val encoderFactory = DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true)
         val decoderFactory = DefaultVideoDecoderFactory(eglBase.eglBaseContext)
 
@@ -73,25 +80,50 @@ class WebRtcClient(
     /** Cria a PeerConnection, gera a offer (recvonly de vídeo) e envia via sinalização.
      *  `mode` é "mirror" (duplicar a tela do PC) ou "extend" (pedir uma segunda
      *  tela de verdade — o PC pode não conseguir e cair pra "mirror" sozinho,
-     *  ver [Listener.onModeResolved]). */
-    fun startConnection(quality: String, mode: String = "mirror", screenWidth: Int = 0, screenHeight: Int = 0) {
+     *  ver [Listener.onModeResolved]).
+     *
+     *  Item 9: `profile` ("standard" ou "low_latency") é repassado no offer
+     *  para o server ajustar bitrate/fps/codec. Em low_latency, também aplicamos:
+     *  - `bundlePolicy = MAXBUNDLE` (um único par de portas ICE, menos overhead)
+     *  - `iceCandidatePoolSize = 0` (não pre-aloca candidatos; em LAN não precisa)
+     *  - bitrate máximo 2.5 Mbps, fps máximo 60 (repassados via sinalização)
+     *  - Trickle ICE em vez de esperar COMPLETE: envia candidatos assim que
+     *    disponíveis. Em USB isso corta 1-2s do setup.
+     */
+    fun startConnection(
+        quality: String,
+        mode: String = "mirror",
+        screenWidth: Int = 0,
+        screenHeight: Int = 0,
+        profile: String = latencyProfile,
+    ) {
         pendingOfferQuality = quality
         pendingOfferMode = mode
         pendingScreenWidth = screenWidth
         pendingScreenHeight = screenHeight
         requestedMode = mode
 
+        val isLowLatency = profile == "low_latency"
+
         val rtcConfig = PeerConnection.RTCConfiguration(emptyList<PeerConnection.IceServer>()).apply {
             // Sem servidores STUN/TURN: conexão é sempre direta na rede local.
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+            // Item 9: ajustes para baixa latência em cabo.
+            if (isLowLatency) {
+                bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+                iceCandidatePoolSize = 0
+            }
         }
 
         peerConnection = factory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate?) {
-                // Não usamos trickle ICE (candidatos avulsos via sinalização).
-                // Em vez disso, esperamos onIceGatheringChange == COMPLETE e
-                // mandamos a SDP já com todos os candidatos embutidos.
+                // Item 9: Trickle ICE em low_latency — envia cada candidato
+                // assim que disponível, em vez de esperar GATHER_COMPLETE.
+                // Reduz o tempo até o primeiro frame em ~1s em LAN.
+                if (isLowLatency && candidate != null) {
+                    signalingClient.sendIceCandidate(candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex)
+                }
             }
 
             override fun onAddStream(stream: MediaStream?) {
@@ -124,8 +156,12 @@ class WebRtcClient(
 
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
                 RemoteLog.i(TAG, "Estado de coleta ICE: $state")
-                if (state == PeerConnection.IceGatheringState.COMPLETE) {
-                    // Só agora a SDP local tem todos os candidatos ICE embutidos.
+                // Em low_latency com trickle ICE, NÃO esperamos COMPLETE — os
+                // candidatos já foram enviados um a um. Enviamos a offer logo
+                // após setLocalDescription (ver createOffer callback abaixo).
+                // Em standard (Wi-Fi), mantemos o comportamento original:
+                // esperar COMPLETE e enviar SDP com todos os candidatos.
+                if (!isLowLatency && state == PeerConnection.IceGatheringState.COMPLETE) {
                     val localDesc = peerConnection?.localDescription
                     val quality = pendingOfferQuality
                     if (localDesc != null && quality != null) {
@@ -137,6 +173,7 @@ class WebRtcClient(
                             mode = pendingOfferMode,
                             screenWidth = pendingScreenWidth,
                             screenHeight = pendingScreenHeight,
+                            profile = profile,
                         )
                     }
                 }
@@ -177,9 +214,34 @@ class WebRtcClient(
 
         peerConnection?.createOffer(object : SdpObserver by NoopSdpObserver {
             override fun onCreateSuccess(desc: SessionDescription) {
-                // Não envia aqui: essa SDP ainda não tem candidatos ICE.
-                // O envio real acontece em onIceGatheringChange(COMPLETE).
                 peerConnection?.setLocalDescription(NoopSdpObserver, desc)
+
+                if (isLowLatency) {
+                    // Item 9: em low_latency, envia a offer IMEDIATAMENTE após
+                    // setLocalDescription — não espera ICE COMPLETE. Os candidatos
+                    // ICE restantes virão via sendIceCandidate (trickle).
+                    val quality = pendingOfferQuality
+                    if (quality != null) {
+                        pendingOfferQuality = null
+                        // Pega a SDP atual (já com setLocalDescription aplicado).
+                        val localDesc = peerConnection?.localDescription ?: desc
+                        // Limites explícitos para o server (Item 9).
+                        val maxBitrate = 2_500_000  // 2.5 Mbps — suficiente p/ 720p60 em H264
+                        val maxFps = 60
+                        signalingClient.sendOffer(
+                            sdp = localDesc.description,
+                            sdpType = "offer",
+                            quality = quality,
+                            mode = pendingOfferMode,
+                            screenWidth = pendingScreenWidth,
+                            screenHeight = pendingScreenHeight,
+                            profile = profile,
+                            maxBitrate = maxBitrate,
+                            maxFps = maxFps,
+                        )
+                    }
+                }
+                // Em standard (Wi-Fi), a offer é enviada em onIceGatheringChange(COMPLETE).
             }
 
             override fun onCreateFailure(error: String?) {

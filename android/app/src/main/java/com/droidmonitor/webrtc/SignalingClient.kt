@@ -39,6 +39,8 @@ class SignalingClient(
     interface Listener {
         fun onPinAccepted()
         fun onPinRejected(blocked: Boolean)
+        /** Item 7: Token QR criptografado rejeitado pelo server (expirado/inválido). */
+        fun onQrTokenError(reason: String?, blocked: Boolean) {}
         fun onAnswerReceived(sdp: String, sdpType: String, resolvedMode: String, modeFallbackReason: String?)
         fun onSignalingError(message: String)
         fun onSignalingClosed()
@@ -97,6 +99,11 @@ class SignalingClient(
         when (json.optString("type")) {
             "pin_ok" -> listener?.onPinAccepted()
             "pin_error" -> listener?.onPinRejected(json.optBoolean("blocked", false))
+            // Item 7: server rejeitou o token QR criptografado.
+            "qr_token_error" -> listener?.onQrTokenError(
+                reason = if (json.isNull("reason")) null else json.optString("reason"),
+                blocked = json.optBoolean("blocked", false),
+            )
             "answer" -> listener?.onAnswerReceived(
                 sdp = json.getString("sdp"),
                 sdpType = json.getString("sdpType"),
@@ -118,13 +125,51 @@ class SignalingClient(
         })
     }
 
-    fun sendOffer(sdp: String, sdpType: String, quality: String, mode: String, screenWidth: Int = 0, screenHeight: Int = 0) {
+    /**
+     * Item 7: envia token QR criptografado (formato ND1) como alternativa ao PIN.
+     *
+     * O server decripta com sua chave AES persistente, valida expiração e
+     * responde `pin_ok` (autentica) ou `qr_token_error` (token inválido/expirado).
+     * O token é opaco para o app — nunca é decifrado localmente.
+     *
+     * O parâmetro `token` deve ser apenas a parte cifrada (sem o prefixo "ND1."
+     * e sem o host:port, que são públicos). O server recompõe o token completo
+     * internamente — ele sabe qual é a parte pública porque foi ele quem gerou.
+     */
+    fun sendQrToken(token: String) {
+        send(JSONObject().apply {
+            put("type", "qr_token")
+            // Reanexa o prefixo ND1. antes de enviar para o server validar.
+            put("token", "ND1.${token}")
+        })
+    }
+
+    /**
+     * Item 9: `profile` pode ser "standard" (Wi-Fi) ou "low_latency" (USB).
+     * O server usa para ajustar bitrate, fps, qualidade JPEG e codec.
+     * `maxBitrate` e `maxFps` são dicas explícitas para o server limitar a
+     * saída de mídia (quando suportado pelo aiortc).
+     */
+    fun sendOffer(
+        sdp: String,
+        sdpType: String,
+        quality: String,
+        mode: String,
+        screenWidth: Int = 0,
+        screenHeight: Int = 0,
+        profile: String = "standard",
+        maxBitrate: Int = 0,
+        maxFps: Int = 0,
+    ) {
         send(JSONObject().apply {
             put("type", "offer")
             put("sdp", sdp)
             put("sdpType", sdpType)
             put("quality", quality)
             put("mode", mode)
+            put("profile", profile)
+            if (maxBitrate > 0) put("maxBitrate", maxBitrate)
+            if (maxFps > 0) put("maxFps", maxFps)
             if (screenWidth > 0 && screenHeight > 0) {
                 put("screenWidth", screenWidth)
                 put("screenHeight", screenHeight)
@@ -144,6 +189,24 @@ class SignalingClient(
         send(JSONObject().apply {
             put("type", "mode_change")
             put("mode", mode)
+        })
+    }
+
+    /**
+     * Item 9: Trickle ICE — envia um candidato ICE avulso para o server.
+     * Usado em perfil LowLatency (cabo USB) para enviar cada candidato assim
+     * que disponível, sem esperar ICE gathering completar. Em LAN, isso corta
+     * ~1s do tempo até o primeiro frame.
+     *
+     * O server aplica via `pc.addIceCandidate()`. Se o server não suportar
+     * trickle, simplesmente ignora — a conexão ainda funciona, só mais lenta.
+     */
+    fun sendIceCandidate(sdp: String, sdpMid: String?, sdpMLineIndex: Int) {
+        send(JSONObject().apply {
+            put("type", "ice_candidate")
+            put("candidate", sdp)
+            put("sdpMid", sdpMid ?: "")
+            put("sdpMLineIndex", sdpMLineIndex)
         })
     }
 

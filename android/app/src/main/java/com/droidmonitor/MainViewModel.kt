@@ -65,6 +65,16 @@ data class UiState(
     val connectedPc: PcInfo? = null,
     /** PIN usado na conexão atual. */
     val connectedPin: String = "",
+    /** True quando há túnel USB ativo (adb reverse em 127.0.0.1:8765). */
+    val usbTunnelActive: Boolean = false,
+    /** Perfil de latência ativo: "standard" (Wi-Fi) ou "low_latency" (USB). */
+    val latencyProfile: String = "standard",
+    /** Mensagem curta para exibir como Toast/snackbar ao usuário
+     *  (ex.: "Toque novamente para sair", "Conectando via cabo"). */
+    val transientHint: String? = null,
+    /** Token QR criptografado (formato ND1) pendente de envio no handshake.
+     *  Quando preenchido, o app envia "qr_token" via WS em vez do PIN em texto. */
+    val pendingQrToken: String? = null,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -83,6 +93,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.SECONDS)
         .build()
+
+    // ---- Estado interno para botão Voltar nativo (Item 5) ----
+    // Timestamp do último toque no botão Voltar durante a transmissão.
+    // 1 toque: envia ESC ao PC; 2 toques em <350ms: desconecta.
+    private var lastBackAt: Long = 0L
+    private val DOUBLE_BACK_THRESHOLD_MS = 350L
+
+    // ---- Monitor de túnel USB (Item 8) ----
+    // Detecta se o adb reverse está ativo em 127.0.0.1:8765. Se sim, qualquer
+    // conexão QR é redirecionada para o cabo (ignora o IP do QRCode).
+    private val usbMonitor = com.droidmonitor.usb.UsbConnectionMonitor(application)
 
     init {
         val initialSettings = settingsRepository.load()
@@ -106,6 +127,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         mdnsDiscovery.start()
+
+        // Item 8: monitora túnel USB ativo. Quando ativo, o QR Code deve ser
+        // redirecionado para 127.0.0.1:8765 em vez do IP da LAN do QR.
+        usbMonitor.onStateChange = { active ->
+            _uiState.update { it.copy(usbTunnelActive = active) }
+        }
+        usbMonitor.start()
     }
 
     private fun pcKey(pc: PcInfo) = "${pc.host}:${pc.port}"
@@ -169,22 +197,110 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Payload esperado, gerado pelo NuDuck Server no QR Code exibido junto ao PIN:
-     * `{"host":"192.168.x.x","port":8765,"name":"meu-pc","pin":"123456"}`.
-     * Se o PIN vier no QR, conecta direto; senão, cai na tela normal de PIN.
+     * Payload aceito (Item 7):
+     *
+     * 1) Token criptografado (formato novo, gerado pelo server após Item 3):
+     *    `ND1.<base64url(host:port)>.<base64url(ciphertext)>`
+     *    O app não decifra — extrai só host:port (parte pública) e reenvia
+     *    o token opaco para o server via WS ("qr_token"). Se o server
+     *    devolver `qr_token_error`, mostra mensagem de "QRCode expirado".
+     *
+     * 2) JSON legado (formato antigo, backward-compat):
+     *    `{"host":"...","port":8765,"name":"...","pin":"123456"}`
+     *    Mantido para servers antigos; recomenda-se atualizar o server.
+     *
+     * Item 8: se o túnel USB estiver ativo (adb reverse em 127.0.0.1:8765),
+     * o IP do QR é ignorado e a conexão é forçada pelo cabo.
      */
     fun onQrCodeScanned(rawValue: String) {
+        val app = getApplication<Application>()
+
+        // ---- Item 7: formato novo (token criptografado ND1) ----
+        if (rawValue.startsWith("ND1.")) {
+            val parts = rawValue.split(".", 2)
+            if (parts.size != 2) {
+                _uiState.update {
+                    it.copy(screen = Screen.ConnectionError(app.getString(R.string.qr_invalid)))
+                }
+                return
+            }
+            // parts[1] = "<b64(host:port)>.<b64(ciphertext)>"
+            val sub = parts[1].split(".", limit = 2)
+            if (sub.size != 2) {
+                _uiState.update {
+                    it.copy(screen = Screen.ConnectionError(app.getString(R.string.qr_invalid)))
+                }
+                return
+            }
+            val hostPort = try {
+                String(android.util.Base64.decode(
+                    sub[0].padEnd((sub[0].length + 3) and.inv(3), '='),
+                    android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP,
+                ), Charsets.UTF_8)
+            } catch (_: Exception) {
+                _uiState.update {
+                    it.copy(screen = Screen.ConnectionError(app.getString(R.string.qr_invalid)))
+                }
+                return
+            }
+            // hostPort = "192.168.1.10:8765"
+            val hostMatch = Regex("^([^:]+):(\\d+)$").find(hostPort)
+            val qrHost = hostMatch?.groupValues?.getOrNull(1) ?: ""
+            val qrPort = hostMatch?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 8765
+
+            // ---- Item 8: prioriza cabo USB se túnel ativo ----
+            val (effectiveHost, effectivePort, viaUsb) = if (usbMonitor.isTunnelActive()) {
+                Triple("127.0.0.1", 8765, true)
+            } else {
+                Triple(qrHost, qrPort, false)
+            }
+
+            if (effectiveHost.isBlank()) {
+                _uiState.update {
+                    it.copy(screen = Screen.ConnectionError(app.getString(R.string.qr_invalid)))
+                }
+                return
+            }
+
+            val pc = PcInfo(
+                name = app.getString(R.string.pc_via_qrcode),
+                host = effectiveHost,
+                port = effectivePort,
+            )
+            // O token criptografado é guardado em memória e reenviado no handshake.
+            _uiState.update {
+                it.copy(
+                    screen = Screen.PinEntry(pc),
+                    prefilledPin = "",
+                    transientHint = if (viaUsb) "Conectando via cabo (USB)" else null,
+                    pendingQrToken = sub[1], // só o ciphertext (a parte cifrada)
+                )
+            }
+            return
+        }
+
+        // ---- Formato legado: JSON com host/port/pin ----
         val pc: PcInfo
         val pin: String
-        val app = getApplication<Application>()
         try {
             val json = org.json.JSONObject(rawValue)
+            val qrHost = json.getString("host")
+            val qrPort = json.optInt("port", 8765)
+            // Item 8: prioriza cabo se túnel USB ativo.
+            val (effectiveHost, effectivePort, viaUsb) = if (usbMonitor.isTunnelActive()) {
+                Triple("127.0.0.1", 8765, true)
+            } else {
+                Triple(qrHost, qrPort, false)
+            }
             pc = PcInfo(
                 name = json.optString("name").ifBlank { app.getString(R.string.pc_via_qrcode) },
-                host = json.getString("host"),
-                port = json.optInt("port", 8765),
+                host = effectiveHost,
+                port = effectivePort,
             )
             pin = json.optString("pin", "")
+            if (viaUsb) {
+                _uiState.update { it.copy(transientHint = "Conectando via cabo (USB)") }
+            }
         } catch (_: Exception) {
             _uiState.update {
                 it.copy(screen = Screen.ConnectionError(app.getString(R.string.qr_invalid)))
@@ -205,12 +321,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun submitPin(pc: PcInfo, pin: String) {
         val mode = _uiState.value.screenMode
-        _uiState.update { it.copy(screen = Screen.Connecting) }
+        // Item 9: se conectando via USB (127.0.0.1) ou túnel ativo, ativa perfil LowLatency.
+        val viaUsb = pc.host == "127.0.0.1" || usbMonitor.isTunnelActive()
+        val profile = if (viaUsb) "low_latency" else "standard"
+        val pendingToken = _uiState.value.pendingQrToken
+        _uiState.update {
+            it.copy(
+                screen = Screen.Connecting,
+                latencyProfile = profile,
+                transientHint = null,
+            )
+        }
 
         val signaling = SignalingClient(pc.host, pc.port)
         signalingClient = signaling
 
-        val rtc = WebRtcClient(getApplication(), signaling)
+        // Item 9: repassa o perfil para o WebRtcClient aplicar ajustes de latência.
+        val rtc = WebRtcClient(getApplication(), signaling, profile)
         webRtcClient = rtc
 
         rtc.listener = object : WebRtcClient.Listener {
@@ -249,9 +376,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         signaling.listener = object : SignalingClient.Listener {
             override fun onPinAccepted() {
-                settingsRepository.savePin(pcKey(pc), pin)
+                // Só guarda PIN no repositório se foi PIN legado (não token).
+                if (pendingToken == null) {
+                    settingsRepository.savePin(pcKey(pc), pin)
+                }
                 val screen = getRealScreenSize()
-                rtc.startConnection(_uiState.value.quality, mode, screen.first, screen.second)
+                // Item 9: profile repassado para o offer (server aplica ajustes).
+                rtc.startConnection(_uiState.value.quality, mode, screen.first, screen.second, profile)
             }
 
             override fun onPinRejected(blocked: Boolean) {
@@ -268,6 +399,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             screen = Screen.PinEntry(pc),
                             pinError = app.getString(R.string.pin_incorrect),
                             prefilledPin = "",
+                        )
+                    }
+                }
+            }
+
+            // Item 7: token QR rejeitado (expirado ou inválido).
+            override fun onQrTokenError(reason: String?, blocked: Boolean) {
+                val app = getApplication<Application>()
+                settingsRepository.forgetPin(pcKey(pc))
+                if (blocked) {
+                    _uiState.update {
+                        it.copy(
+                            screen = Screen.ConnectionError(app.getString(R.string.pin_too_many_attempts)),
+                            pendingQrToken = null,
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            screen = Screen.ConnectionError("QRCode expirado. Escaneie novamente."),
+                            pendingQrToken = null,
                         )
                     }
                 }
@@ -301,7 +453,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             signaling.connect()
-            signaling.sendPin(pin)
+            if (pendingToken != null) {
+                // Item 7: envia token criptografado opaco ao server.
+                signaling.sendQrToken(pendingToken)
+            } else {
+                signaling.sendPin(pin)
+            }
         }
     }
 
@@ -395,12 +552,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         webRtcClient = null
         signalingClient = null
         _remoteVideoTrack.value = null
-        _uiState.update { it.copy(screen = Screen.Discovery, pinError = null, modeNotice = null, shortcuts = emptyList()) }
+        _uiState.update {
+            it.copy(
+                screen = Screen.Discovery,
+                pinError = null,
+                modeNotice = null,
+                shortcuts = emptyList(),
+                pendingQrToken = null,
+                latencyProfile = "standard",
+                transientHint = null,
+            )
+        }
+    }
+
+    /**
+     * Lógica do botão Voltar nativo (Item 5).
+     *
+     * - 1 toque: envia ESC ao PC (volta/cancela ação no app ativo do display).
+     *   Mostra o hint "Toque novamente para sair".
+     * - 2 toques em <350ms: chama [onExit] (desconecta e volta pra Discovery).
+     *
+     * Não chama nada de UI direto — só dispara callbacks para a Composable
+     * dona do BackHandler (em ConnectedScreen) decidir o que fazer.
+     */
+    fun handleSystemBack(onPromptExit: () -> Unit, onExit: () -> Unit) {
+        val now = System.currentTimeMillis()
+        if (now - lastBackAt < DOUBLE_BACK_THRESHOLD_MS) {
+            // Toque duplo: sair.
+            lastBackAt = 0L
+            _uiState.update { it.copy(transientHint = null) }
+            onExit()
+        } else {
+            // Toque simples: envia ESC ao PC e pede outro toque pra sair.
+            lastBackAt = now
+            _uiState.update { it.copy(transientHint = "Toque novamente para sair") }
+            // Envia ESC. O server já trata {"type":"key","key":"escape"} via
+            // pyautogui (mirror) ou xdotool (extend). Sem necessidade de
+            // mudança no server — o tipo "key" já existe no protocolo.
+            if (_uiState.value.settings.sendControlEvents) {
+                webRtcClient?.sendControlEvent(com.droidmonitor.webrtc.ControlEvents.key("escape"))
+            }
+            onPromptExit()
+        }
+    }
+
+    /** Limpa o hint transitório (chamado pela UI depois de mostrar o Toast). */
+    fun clearTransientHint() {
+        _uiState.update { it.copy(transientHint = null) }
     }
 
     override fun onCleared() {
         super.onCleared()
         mdnsDiscovery.stop()
+        usbMonitor.stop()
         webRtcClient?.close()
         signalingClient?.close()
     }

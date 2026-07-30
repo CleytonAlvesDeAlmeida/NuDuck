@@ -1,5 +1,6 @@
 package com.droidmonitor.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -104,6 +105,25 @@ fun FloatingMenuHost(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
+        // Item 5: BackHandler interno do FloatingMenu. Quando o menu está
+        // em subpágina (QUALITY / MODE / SHORTCUTS), o botão Voltar volta
+        // para EXPANDED. Quando está EXPANDED, volta para COLLAPSED. Quando
+        // está COLLAPSED, desativa — deixando o BackHandler da ConnectedScreen
+        // (lógica de duplo-toque ESC/sair) assumir.
+        BackHandler(enabled = stage != MenuStage.COLLAPSED) {
+            when (stage) {
+                MenuStage.QUALITY, MenuStage.MODE, MenuStage.SHORTCUTS -> {
+                    markInteraction()
+                    stage = MenuStage.EXPANDED
+                }
+                MenuStage.EXPANDED -> {
+                    markInteraction()
+                    stage = MenuStage.COLLAPSED
+                }
+                else -> {}
+            }
+        }
+
         if (stage != MenuStage.COLLAPSED) {
             Box(
                 modifier = Modifier

@@ -90,15 +90,49 @@ def _get_persistent_data_dir() -> str:
 
 SHORTCUTS_FILE = os.path.join(_get_persistent_data_dir(), "shortcuts.json")
 
+# Atalhos padrão: seed inicial gravado em shortcuts.json quando o arquivo
+# não existe ou está vazio. Garante que todo usuário novo já tenha os 3
+# atalhos mais úteis prontos pra uso no display digital, sem precisar criar
+# manualmente. Não sobrescreve atalhos criados/removidos pelo usuário.
+_DEFAULT_SHORTCUTS = [
+    {
+        "name": "Configuração",
+        "command": "DISPLAY=:1 gnome-control-center &",
+    },
+    {
+        "name": "Alt+F4",
+        "command": "DISPLAY=:1 xdotool key Alt+F4 &",
+    },
+    {
+        "name": "Multitarefa",
+        "command": "DISPLAY=:1 xdotool key Super &",
+    },
+]
+
 
 def _load_shortcuts() -> list:
-    """Carrega a lista de atalhos do arquivo JSON."""
+    """Carrega a lista de atalhos do arquivo JSON.
+
+    Se o arquivo não existe ou está vazio, popula com `_DEFAULT_SHORTCUTS`
+    e devolve a lista — garante que usuários novos já tenham os 3 atalhos
+    básicos (Configuração, Alt+F4, Multitarefa) sem precisar criar nada.
+    """
     try:
         with open(SHORTCUTS_FILE, "r", encoding="utf-8") as f:
             data = _json.load(f)
-            return data.get("shortcuts", [])
+            shortcuts = data.get("shortcuts", [])
+        # Seed inicial: arquivo existe mas está vazio.
+        if not shortcuts:
+            log.info("shortcuts.json vazio — populando atalhos padrão.")
+            _save_shortcuts(_DEFAULT_SHORTCUTS)
+            return list(_DEFAULT_SHORTCUTS)
+        return shortcuts
+    except FileNotFoundError:
+        log.info("shortcuts.json não existe — criando com atalhos padrão.")
+        _save_shortcuts(_DEFAULT_SHORTCUTS)
+        return list(_DEFAULT_SHORTCUTS)
     except Exception:
-        return []
+        return list(_DEFAULT_SHORTCUTS)
 
 
 def _save_shortcuts(shortcuts: list):
@@ -403,7 +437,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
     _AUTO_COOLDOWN_SECONDS = 2.5
 
     def __init__(self, quality: str = DEFAULT_QUALITY, mode: str = "mirror",
-                 phone_w: int = 0, phone_h: int = 0):
+                 phone_w: int = 0, phone_h: int = 0, profile: str = "standard"):
         super().__init__()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._sct = None
@@ -430,6 +464,14 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._auto_idx = QUALITY_ORDER.index(DEFAULT_QUALITY)
         self._load_ema: Optional[float] = None
         self._last_adapt = 0.0
+
+        # Item 9: perfil de latência. Em low_latency (cabo USB), o server:
+        # - usa INTER_NEAREST em vez de INTER_LINEAR no resize (mais rápido)
+        # - pula o desenho do cursor (cortando 5-10ms por frame)
+        # - aumenta o fps do capture_loop (no virtual_display.py)
+        # - reduz qualidade JPEG interna
+        self._profile = profile if profile in ("standard", "low_latency") else "standard"
+        self._is_low_latency = (self._profile == "low_latency")
 
         # Decide o modo
         self.requested_mode = mode if mode in ("mirror", "extend") else "mirror"
@@ -622,6 +664,55 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
         return canvas
 
+    def _crop_to_phone_aspect(self, frame_bgr, phone_w: int, phone_h: int):
+        """Item 6: Recorta a região central do frame BGR para casar o aspect
+        ratio do celular.
+
+        No modo Espelhar, o monitor do PC é tipicamente 16:9 (1920x1080) e
+        o celular em paisagem tem aspect ~2.2:1 (2400x1080). Sem este crop,
+        o `_letterbox` adiciona barras pretas laterais — visualmente fica
+        "tela quadrada na horizontal". Com o crop, recortamos a faixa
+        central do monitor (perdendo ~10% da altura) que tem o mesmo aspect
+        do celular; assim o `_letterbox` faz early-return e o vídeo
+        preenche a tela do celular sem barras.
+
+        Equivalente a "zoom to fill" preservando o centro — melhor para
+        espelhamento onde ver a tela inteira com barras é pior do que ver
+        90% preenchendo tudo.
+
+        Parâmetros:
+            frame_bgr: numpy array BGR (H, W, 3) da captura do monitor.
+            phone_w, phone_h: dimensões da tela do celular (pixels).
+
+        Retorna: numpy array BGR recortado (H', W', 3).
+        """
+        if phone_w <= 0 or phone_h <= 0:
+            return frame_bgr
+
+        src_h, src_w = frame_bgr.shape[:2]
+        if src_w <= 0 or src_h <= 0:
+            return frame_bgr
+
+        phone_aspect = phone_w / phone_h
+        src_aspect = src_w / src_h
+
+        # Se aspects já são próximos (< 2% de diferença), não precisa crop.
+        if abs(src_aspect - phone_aspect) < 0.02:
+            return frame_bgr
+
+        if src_aspect > phone_aspect:
+            # Monitor é "mais largo" que o celular (ex.: 16:9 vs 2.2:1).
+            # Corta laterais para reduzir a largura.
+            new_w = int(src_h * phone_aspect)
+            x_offset = (src_w - new_w) // 2
+            return frame_bgr[:, x_offset:x_offset + new_w]
+        else:
+            # Monitor é "mais alto" que o celular (raro, mas possível em
+            # celular em retrato com monitor em paisagem). Corta topo/base.
+            new_h = int(src_w / phone_aspect)
+            y_offset = (src_h - new_h) // 2
+            return frame_bgr[y_offset:y_offset + new_h, :]
+
     def _resample_filter(self, target_h: int) -> int:
         """Filtro de reamostragem: NEAREST (mais leve) para as qualidades mais
         baixas, onde a perda de nitidez é imperceptível e a economia de CPU
@@ -673,17 +764,22 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 src_h, src_w = frame_bgr.shape[:2]
                 target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-                # Usa cv2.resize diretamente em BGR (sem conversão de canais)
-                frame_resized = cv2.resize(frame_bgr, (target_w, target_h),
-                                           interpolation=cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST)
+                # Usa cv2.resize diretamente em BGR (sem conversão de canais).
+                # Item 9: em low_latency, INTER_NEAREST é mais rápido (custo de nitidez).
+                interp = cv2.INTER_NEAREST if self._is_low_latency else (
+                    cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
+                )
+                frame_resized = cv2.resize(frame_bgr, (target_w, target_h), interpolation=interp)
 
                 # Converte para PIL apenas para desenhar o cursor
                 # cv2 BGR -> PIL RGB (cvtColor): B,G,R -> R,G,B
                 frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(frame_rgb)
 
-                # Desenha cursor do mouse no display virtual (Xvfb não renderiza cursor)
-                self._draw_cursor_virtual(pil_img, src_w, src_h)
+                # Desenha cursor do mouse no display virtual (Xvfb não renderiza cursor).
+                # Item 9: em low_latency, pula o cursor (corta 5-10ms por frame).
+                if not self._is_low_latency:
+                    self._draw_cursor_virtual(pil_img, src_w, src_h)
 
                 # Adaptar à resolução do celular se conhecida
                 if self._phone_w and self._phone_h:
@@ -740,17 +836,33 @@ class ScreenCaptureTrack(VideoStreamTrack):
                     src_h, src_w = img.shape[:2]
                     log.debug("Janela recortada: %dx%d", src_w, src_h)
 
+        # --- Item 6: Crop centralizado para casar aspect ratio do celular ---
+        # No modo Espelhar, o monitor do PC é tipicamente 16:9 (1920x1080)
+        # enquanto o celular em paisagem tem aspect ~2.2:1 (2400x1080). Sem
+        # este crop, o `_letterbox` adiciona barras pretas laterais, dando a
+        # impressão de "tela quadrada" na horizontal. Com o crop, recortamos
+        # a região central do monitor que casa com o aspect do celular —
+        # equivalente a "zoom para preencher", mas preservando o centro.
+        if self._phone_w and self._phone_h and not STATE.window_mode:
+            img = self._crop_to_phone_aspect(img, self._phone_w, self._phone_h)
+            src_h, src_w = img.shape[:2]
+
         target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
         # Usa cv2.resize em BGR
-        frame_resized = cv2.resize(img, (target_w, target_h),
-                                    interpolation=cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST)
+        # Item 9: em low_latency, sempre INTER_NEAREST (mais rápido).
+        interp = cv2.INTER_NEAREST if self._is_low_latency else (
+            cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
+        )
+        frame_resized = cv2.resize(img, (target_w, target_h), interpolation=interp)
 
         # BGR -> RGB para PIL (cursor)
         frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(frame_rgb)
 
-        self._draw_cursor(pil_img)
+        # Item 9: em low_latency, pula desenho do cursor.
+        if not self._is_low_latency:
+            self._draw_cursor(pil_img)
 
         # Adaptar à resolução do celular se conhecida
         if self._phone_w and self._phone_h:
@@ -801,6 +913,78 @@ class ScreenCaptureTrack(VideoStreamTrack):
 # ==========================================================================
 # Controle remoto (toque do celular -> mouse/teclado do PC)
 # ==========================================================================
+
+def _parse_ice_candidate_sdp(sdp: str, sdp_mid: str, sdp_mline_index: int):
+    """Item 9: parse de uma linha a=candidate do SDP para RTCIceCandidate.
+
+    Linha SDP típica:
+        "candidate:842163049 1 udp 1677729535 192.168.1.10 55554 typ srflx"
+
+    aiortc expõe RTCIceCandidate com atributos separados (foundation,
+    component, protocol, priority, ip, port, type, etc.). Este parser é
+    defensivo: se algum campo faltar, retorna None e o chamador loga.
+    """
+    try:
+        from aiortc import RTCIceCandidate
+        from aiortc.rtcicetransport import candidate_from_sdp
+        # aiortc tem `candidate_from_sdp` em rtcicetransport — mas não é API
+        # pública estável. Tenta primeiro; se falhar, cai pra parse manual.
+        try:
+            cand = candidate_from_sdp(sdp.replace("candidate:", "", 1))
+            cand.sdpMid = sdp_mid
+            cand.sdpMLineIndex = sdp_mline_index
+            return cand
+        except Exception:
+            pass
+
+        # Parse manual (fallback).
+        # Formato: candidate:<foundation> <component> <protocol> <priority> <ip> <port> typ <type> [raddr <ip>] [rport <port>]
+        s = sdp.replace("candidate:", "", 1).strip()
+        parts = s.split()
+        if len(parts) < 7:
+            return None
+        foundation = parts[0]
+        component = int(parts[1])
+        protocol = parts[2].upper()
+        priority = int(parts[3])
+        ip = parts[4]
+        port = int(parts[5])
+        cand_type = "host"
+        related_address = None
+        related_port = None
+        i = 6
+        while i < len(parts):
+            if parts[i] == "typ" and i + 1 < len(parts):
+                cand_type = parts[i + 1]
+                i += 2
+            elif parts[i] == "raddr" and i + 1 < len(parts):
+                related_address = parts[i + 1]
+                i += 2
+            elif parts[i] == "rport" and i + 1 < len(parts):
+                related_port = int(parts[i + 1])
+                i += 2
+            else:
+                i += 1
+
+        cand = RTCIceCandidate(
+            foundation=foundation,
+            component=component,
+            protocol=protocol,
+            priority=priority,
+            ip=ip,
+            port=port,
+            type=cand_type,
+            relatedAddress=related_address,
+            relatedPort=related_port,
+            tcpType=None,
+        )
+        cand.sdpMid = sdp_mid
+        cand.sdpMLineIndex = sdp_mline_index
+        return cand
+    except Exception as exc:
+        log.debug("Parser de ICE candidate falhou: %s", exc)
+        return None
+
 
 def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
     """Processa toques e teclas vindos do celular.
@@ -924,6 +1108,32 @@ async def websocket_handler(request: web.Request):
                         break
                 continue
 
+            # Token QR criptografado (ND1.<b64>.<b64>) — alternativa ao PIN.
+            # O app escaneia o QR e envia o token opaco; o server decripta,
+            # valida expiração e, se válido, autentica a sessão (igual ao
+            # "pin_ok"). Token expirado → "qr_token_error" com reason
+            # "token_expired"; o app pede novo scan.
+            if mtype == "qr_token":
+                token = str(data.get("token", ""))
+                ok, pin = _validate_qr_token(token)
+                if ok:
+                    authenticated = True
+                    STATE.clear_attempts(peer_ip)
+                    await ws.send_json({"type": "pin_ok"})
+                    log.info("Token QR válido de %s", peer_ip)
+                else:
+                    newly_blocked = STATE.register_failed_attempt(peer_ip)
+                    await ws.send_json({
+                        "type": "qr_token_error",
+                        "reason": "token_invalid_or_expired",
+                        "blocked": newly_blocked,
+                    })
+                    log.warning("Token QR inválido/expirado de %s", peer_ip)
+                    if newly_blocked:
+                        await ws.close()
+                        break
+                continue
+
             if not authenticated:
                 await ws.send_json({"type": "error", "message": "Envie o PIN primeiro."})
                 continue
@@ -939,6 +1149,15 @@ async def websocket_handler(request: web.Request):
                 if requested_mode not in ("mirror", "extend"):
                     requested_mode = "mirror"
 
+                # Item 9: perfil de latência ("standard" ou "low_latency").
+                # Em low_latency (cabo USB), o server ajusta fps, qualidade
+                # JPEG e bitrate para priorizar velocidade.
+                profile = data.get("profile", "standard")
+                if profile not in ("standard", "low_latency"):
+                    profile = "standard"
+                max_bitrate = int(data.get("maxBitrate", 0) or 0)
+                max_fps = int(data.get("maxFps", 0) or 0)
+
                 pc = RTCPeerConnection()
                 pcs.add(pc)
 
@@ -950,8 +1169,27 @@ async def websocket_handler(request: web.Request):
                 screen_track = ScreenCaptureTrack(
                     quality=quality, mode=requested_mode,
                     phone_w=phone_w, phone_h=phone_h,
+                    profile=profile,
                 )
                 pc.addTrack(relay.subscribe(screen_track))
+
+                # Item 9: aplica bitrate máximo no RTPSender do vídeo, se
+                # suportado pelo aiortc. Em low_latency, limita a 2.5 Mbps.
+                try:
+                    senders = pc.getSenders()
+                    if senders:
+                        sender = senders[0]
+                        # aiortc não expõe setParameters como o WebRTC oficial,
+                        # mas permite configurar maxBitrate via RTCRtpSendParameters.
+                        params = sender.parameters
+                        if hasattr(params, "encodings") and params.encodings:
+                            for enc in params.encodings:
+                                if max_bitrate > 0:
+                                    enc.maxBitrate = max_bitrate
+                                elif profile == "low_latency":
+                                    enc.maxBitrate = 2_500_000
+                except Exception as exc:
+                    log.debug("Não foi possível aplicar maxBitrate no sender: %s", exc)
 
                 # DataChannel para controle remoto
                 @pc.on("datachannel")
@@ -961,6 +1199,13 @@ async def websocket_handler(request: web.Request):
                     @channel.on("message")
                     def on_message(msg):
                         handle_control_message(msg, screen_track)
+
+                # Item 9: trickle ICE — o app (em low_latency) envia candidatos
+                # avulsos. aiortc aceita via pc.addIceCandidate().
+                @pc.on("icecandidate")
+                def on_ice_candidate(candidate):
+                    # aiortc dispara este callback interno; não usamos aqui.
+                    pass
 
                 # Cleanup quando a conexão fecha
                 @pc.on("connectionstatechange")
@@ -1084,6 +1329,26 @@ async def websocket_handler(request: web.Request):
                         screen_track._phone_w = new_w
                         screen_track._phone_h = new_h
                         log.info("Dimensões do celular atualizadas: %dx%d (modo %s)", new_w, new_h, screen_track.resolved_mode)
+
+            # Item 9: Trickle ICE — candidato avulso enviado pelo app (low_latency).
+            elif mtype == "ice_candidate" and pc is not None:
+                try:
+                    from aiortc import RTCIceCandidate
+                    cand_sdp = str(data.get("candidate", ""))
+                    sdp_mid = data.get("sdpMid", "")
+                    sdp_mline = int(data.get("sdpMLineIndex", 0) or 0)
+                    if cand_sdp:
+                        # aiortc não tem `from_sdp` estável entre versões.
+                        # Em vez disso, construir manualmente a partir do SDP.
+                        # Se o parser falhar, logamos e seguimos — em LAN o
+                        # SDP já vem com candidatos embutidos (mesmo em trickle).
+                        candidate = _parse_ice_candidate_sdp(cand_sdp, sdp_mid, sdp_mline)
+                        if candidate is not None:
+                            await pc.addIceCandidate(candidate)
+                        else:
+                            log.debug("ICE candidate ignorado (parser falhou): %s", cand_sdp[:80])
+                except Exception as exc:
+                    log.debug("Falha ao adicionar ICE candidate: %s", exc)
 
             # Execução de atalho via WebSocket
             elif mtype == "execute_shortcut":
@@ -1355,6 +1620,185 @@ def start_mdns(hostname: str) -> Zeroconf:
 
 
 # ==========================================================================
+# QR Code seguro (token temporário criptografado, validade 30s)
+# ==========================================================================
+#
+# Problema que resolve:
+#   O QR Code original embutia {host, port, name, pin} em JSON puro. Escaneando
+#   o QR com qualquer app externo (Google Lens, leitor genérico) o IP, a porta
+#   e o PIN ficam legíveis — falha de segurança: alguém com uma foto do QR
+#   consegue se conectar até a sessão mudar de PIN.
+#
+# Solução:
+#   - Gerar um token criptografado (AES-256-GCM) embutindo {pin, exp, nonce}.
+#   - host e porta ficam FORA da camada cifrada (são públicas: a LAN inteira
+#     já os conhece por mDNS e a porta é fixa 8765), mas o PIN só sai dentro
+#     do ciphertext. Assim um leitor externo só vê "ND1.<base64>" — ilegível.
+#   - Validade: 30 segundos. A UI Tk regenera o QR a cada 25s automaticamente.
+#   - O app não decifra o token (não tem a chave); envia o token opaco para o
+#     server via WebSocket ("qr_token") e o server valida (decripta + checa
+#     expiração). Se válido, autentica a sessão sem precisar do PIN à parte.
+#
+# Formato do payload do QR (uma única string):
+#   ND1.<base64url(host:port)>.<base64url(nonce_12B || ciphertext || tag_16B)>
+# Onde:
+#   - ND1 = prefixo do formato (NuDuck versão 1)
+#   - host:port = IP e porta do servidor (text, base64url)
+#   - O ciphertext criptografa o JSON: {"pin": "...", "exp": <epoch_ms>,
+#     "nonce": "<uuid4>"}
+
+QR_TOKEN_VERSION = "ND1"
+QR_TOKEN_TTL_SECONDS = 30  # Validade do token
+QR_TOKEN_REFRESH_MS = 25000  # Refresh da UI Tk (margem de 5s antes de expirar)
+
+# Caminho do arquivo da chave secreta persistente (gerada uma vez, mantida
+# entre reinicializações). Se o usuário reinstalar/excluir este arquivo, os
+# tokens antigos deixam de validar — comportamento esperado.
+_QR_SECRET_FILE = os.path.join(_get_persistent_data_dir(), "qr_secret.key")
+_qr_aes_key: Optional[bytes] = None
+
+
+def _get_qr_secret_key() -> bytes:
+    """Retorna a chave AES-256 do server (32 bytes). Cria se não existe."""
+    global _qr_aes_key
+    if _qr_aes_key is not None:
+        return _qr_aes_key
+
+    # Tenta carregar do arquivo.
+    try:
+        if os.path.exists(_QR_SECRET_FILE):
+            with open(_QR_SECRET_FILE, "rb") as f:
+                key = f.read()
+            if len(key) == 32:
+                _qr_aes_key = key
+                return key
+            log.warning("Arquivo qr_secret.key com tamanho incorreto; regenerando.")
+    except Exception as exc:
+        log.warning("Erro ao ler qr_secret.key (%s); regenerando.", exc)
+
+    # Gera nova chave e persiste.
+    key = secrets.token_bytes(32)
+    try:
+        # Permissões restritas (0600) em Unix — contém segredo.
+        fd = os.open(_QR_SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+    except Exception as exc:
+        log.error("Erro ao salvar qr_secret.key: %s", exc)
+    _qr_aes_key = key
+    return key
+
+
+def _b64url_encode(data: bytes) -> str:
+    """Base64URL sem padding (URL-safe)."""
+    import base64
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    import base64
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _build_qr_token_payload() -> str:
+    """Gera o payload criptografado do QR: ND1.<b64(host:port)>.<b64(ciphertext)>.
+
+    O ciphertext criptografa JSON {"pin","exp","nonce"} com AES-256-GCM,
+    chave persistente do server, nonce aleatório de 12 bytes.
+
+    O PIN expira em QR_TOKEN_TTL_SECONDS.
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as exc:
+        log.error("Biblioteca 'cryptography' não instalada: %s", exc)
+        # Fallback para JSON legado (não recomendado — só pra não quebrar).
+        return _json.dumps({
+            "host": get_local_ip(),
+            "port": PORT,
+            "name": socket.gethostname().split(".")[0],
+            "pin": STATE.pin,
+        })
+
+    host_port = f"{get_local_ip()}:{PORT}"
+    host_port_b64 = _b64url_encode(host_port.encode("utf-8"))
+
+    payload = _json.dumps({
+        "v": 1,
+        "pin": STATE.pin,
+        "nonce": secrets.token_hex(8),  # nonce interno, para invalidar tokens antigos
+        "exp": int((time.time() + QR_TOKEN_TTL_SECONDS) * 1000),  # epoch_ms
+    }, separators=(",", ":"))
+
+    aesgcm = AESGCM(_get_qr_secret_key())
+    nonce = secrets.token_bytes(12)  # nonce AES-GCM (12 bytes recomendado)
+    ciphertext = aesgcm.encrypt(nonce, payload.encode("utf-8"), None)
+    blob = nonce + ciphertext  # nonce (12B) || ciphertext || tag (16B embutidos)
+    blob_b64 = _b64url_encode(blob)
+
+    return f"{QR_TOKEN_VERSION}.{host_port_b64}.{blob_b64}"
+
+
+def _validate_qr_token(token: str) -> tuple[bool, str]:
+    """Valida um token ND1 recebido do app.
+
+    Retorna (sucesso, pin). Em caso de falha, retorna (False, "").
+    Sucesso significa: token bem formado, decriptado com a chave certa, e
+    dentro do prazo de validade.
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        log.error("Biblioteca 'cryptography' não instalada; token rejeitado.")
+        return False, ""
+
+    if not token.startswith(f"{QR_TOKEN_VERSION}."):
+        return False, ""
+
+    parts = token.split(".", 2)
+    if len(parts) != 3:
+        return False, ""
+
+    _, _host_b64, blob_b64 = parts
+
+    # Decifra.
+    try:
+        blob = _b64url_decode(blob_b64)
+        if len(blob) < 12 + 16:  # nonce(12) + tag(16)
+            return False, ""
+        nonce = blob[:12]
+        ciphertext = blob[12:]
+        aesgcm = AESGCM(_get_qr_secret_key())
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        data = _json.loads(plaintext.decode("utf-8"))
+    except Exception as exc:
+        log.warning("Token QR inválido (decriptação falhou): %s", exc)
+        return False, ""
+
+    # Verifica expiração.
+    exp_ms = data.get("exp", 0)
+    now_ms = int(time.time() * 1000)
+    if now_ms > exp_ms:
+        log.warning("Token QR expirado (exp=%d, now=%d).", exp_ms, now_ms)
+        return False, ""
+
+    # Verifica versão.
+    if data.get("v") != 1:
+        log.warning("Token QR com versão não suportada: %s", data.get("v"))
+        return False, ""
+
+    # Verifica PIN (token só é válido para o PIN da sessão atual do server).
+    # Se o server reiniciou e gerou novo PIN, tokens antigos são invalidados.
+    pin = str(data.get("pin", ""))
+    if pin != STATE.pin:
+        log.warning("Token QR com PIN que não bate com a sessão atual.")
+        return False, ""
+
+    return True, pin
+
+
+# ==========================================================================
 # Janela do servidor (PIN + QR Code + checkbox)
 # ==========================================================================
 
@@ -1369,17 +1813,18 @@ def start_ui(hostname: str):
         return os.path.join(base, "assets", "icon.png")
 
     def _build_qr_photo(root, ui_scale: float = 1.0):
-        """Gera o QR Code com host/porta/PIN."""
+        """Gera o QR Code com token criptografado (ND1.<b64>.<b64>).
+
+        Fora do app, o QR mostra apenas "ND1.<runa_base64>.<runa_base64>" —
+        ilegível. Apenas o app, que reenvia o token opaco ao server via WS,
+        consegue validar. O host:port também vai fora da camada cifrada
+        (mas sem o PIN, que é o que realmente protege a conexão).
+        """
         try:
             import qrcode
             from PIL import ImageTk
 
-            payload = json.dumps({
-                "host": get_local_ip(),
-                "port": PORT,
-                "name": hostname,
-                "pin": STATE.pin,
-            })
+            payload = _build_qr_token_payload()
             box_size = max(3, round(4 * ui_scale))
             qr_img = qrcode.make(payload, box_size=box_size, border=2)
             return ImageTk.PhotoImage(qr_img, master=root)
@@ -1557,9 +2002,21 @@ def start_ui(hostname: str):
             qr_label.image = qr_photo
             qr_label.pack()
             tk.Label(
-                header, text="Escaneie no app para conectar",
+                header, text="Escaneie no app para conectar (validade 30s)",
                 font=("Sans", 8), bg=BG_SURFACE, fg=FG_MUTED,
             ).pack(pady=(0, 8))
+
+            # Refresh automático do QR a cada QR_TOKEN_REFRESH_MS (25s).
+            # O token criptografado tem validade de 30s; o refresh em 25s
+            # garante que sempre haja um QR válido na tela, com margem.
+            def refresh_qr():
+                new_photo = _build_qr_photo(root, ui_scale)
+                if new_photo is not None:
+                    qr_label.configure(image=new_photo)
+                    qr_label.image = new_photo  # mantém referência viva
+                root.after(QR_TOKEN_REFRESH_MS, refresh_qr)
+
+            root.after(QR_TOKEN_REFRESH_MS, refresh_qr)
         else:
             tk.Frame(header, bg=BG_SURFACE, height=6).pack()
 

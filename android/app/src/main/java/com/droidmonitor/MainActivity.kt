@@ -3,6 +3,7 @@ package com.droidmonitor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -475,10 +476,39 @@ fun ConnectedScreen(
     val remoteTrack by viewModel.remoteVideoTrack.collectAsState()
     var showSettingsDialog by remember { mutableStateOf(false) }
 
+    // ---- Tela cheia imersiva (Item 4) ----
+    // Enquanto estivermos em ConnectedScreen, esconde system bars (status +
+    // navegação) e desenha edge-to-edge. Sai automaticamente ao desmontar
+    // (volta para Discovery) — ver ImmersiveModeEffect.
+    com.droidmonitor.ui.ImmersiveModeEffect(active = true)
+
+    // ---- Botão Voltar nativo (Item 5) ----
+    // BackHandler tem precedência sobre BackHandler interno do FloatingMenu
+    // (que só está ativo quando o menu está expandido). Quando o menu está
+    // COLLAPSED, este BackHandler dispara: 1 toque = enviar ESC ao PC,
+    // 2 toques rápidos (< 350ms) = sair da transmissão.
+    BackHandler(enabled = !showSettingsDialog) {
+        viewModel.handleSystemBack(
+            onPromptExit = {
+                // 1 toque: envia ESC. O hint "Toque novamente para sair"
+                // é mostrado pelo ViewModel via uiState.transientHint.
+            },
+            onExit = {
+                // 2 toques: desconecta e volta para Discovery.
+                viewModel.disconnect()
+            },
+        )
+    }
+
     // Detecta rotação do celular e envia nova resolução ao servidor.
     // No modo Estender, isso faz o Xvfb ser redimensionado automaticamente.
+    // No modo Espelhar, faz o server recalcular o crop de aspect ratio (Item 6).
+    //
+    // Antes era só configuration.orientation (só dispara em portrait↔landscape).
+    // Agora dispara em QUALQUER mudança de dimensão — cobre foldable abrindo,
+    // multi-window redimensionado, tablet em modo livre, etc. (Item 6).
     val configuration = LocalConfiguration.current
-    LaunchedEffect(configuration.orientation) {
+    LaunchedEffect(configuration.screenWidthDp, configuration.screenHeightDp) {
         val (w, h) = viewModel.getRealScreenSize()
         viewModel.sendScreenResize(w, h)
     }

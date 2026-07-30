@@ -157,6 +157,12 @@ class XvfbVirtualDisplay:
         if not self._wm_name:
             log.warning("Nenhum WM encontrado. Instale openbox.")
 
+        # Clona aparência do display principal (:0) para o display virtual (:N).
+        # Replica tema GTK, ícones, fonte, cursor, papel de parede e variante
+        # de cor — sem isso, o display digital fica com fundo sólido e tema
+        # padrão, parecendo bem diferente do monitor principal.
+        self._clone_display0_appearance()
+
         # Abre um terminal automaticamente no display virtual
         self._open_initial_terminal(env)
 
@@ -221,6 +227,153 @@ class XvfbVirtualDisplay:
                 time.sleep(0.3)
         except Exception:
             pass
+
+    def _clone_display0_appearance(self):
+        """Clona tema GTK, ícones, fonte, cursor, papel de parede e variante
+        de cor do display principal (:0) para o display virtual (:N).
+
+        Tenta cobrir GNOME, XFCE, MATE, Cinnamon, LXQt e fallbacks baseados
+        em arquivo (settings.ini do GTK3). Cada passo é independente e falha
+        silenciosamente: se um ambiente não tem `gsettings`/`xfconf-query`,
+        o resto ainda assim é aplicado. Não bloqueia o start do Xvfb.
+        """
+        if not self.display_name:
+            return
+        if not shutil.which("gsettings") and not shutil.which("xfconf-query"):
+            log.warning(
+                "Nem gsettings nem xfconf-query disponíveis — aparência do display virtual "
+                "não será clonada do display principal."
+            )
+            return
+
+        # Lê um valor gsettings do display :0.
+        def read_gsettings_d0(schema: str, key: str) -> str | None:
+            if not shutil.which("gsettings"):
+                return None
+            env0 = {**os.environ, "DISPLAY": ":0"}
+            try:
+                r = subprocess.run(
+                    ["gsettings", "get", schema, key],
+                    env=env0, capture_output=True, text=True, timeout=2,
+                )
+                if r.returncode == 0:
+                    # gsettings devolve o valor com aspas simples: 'Adwaita'
+                    val = r.stdout.strip()
+                    if val.startswith("'") and val.endswith("'"):
+                        val = val[1:-1]
+                    elif val.startswith('"') and val.endswith('"'):
+                        val = val[1:-1]
+                    return val if val else None
+            except Exception:
+                pass
+            return None
+
+        # Aplica um valor gsettings no display virtual.
+        def apply_gsettings_dn(schema: str, key: str, value: str) -> bool:
+            if not shutil.which("gsettings") or not value:
+                return False
+            env_n = {**os.environ, "DISPLAY": self.display_name}
+            try:
+                r = subprocess.run(
+                    ["gsettings", "set", schema, key, f"'{value}'"],
+                    env=env_n, capture_output=True, text=True, timeout=2,
+                )
+                return r.returncode == 0
+            except Exception:
+                return False
+
+        # Lê paper-uri do GNOME (dark ou light).
+        def read_gnome_wallpaper() -> str | None:
+            # Tenta dark primeiro (padrão GNOME 42+), depois light.
+            for key in ("picture-uri-dark", "picture-uri"):
+                val = read_gsettings_d0("org.gnome.desktop.background", key)
+                if val:
+                    # Remove prefixo file://
+                    if val.startswith("file://"):
+                        return val[7:]
+                    return val
+            return None
+
+        # Lê wallpaper do XFCE.
+        def read_xfce_wallpaper() -> str | None:
+            if not shutil.which("xfconf-query"):
+                return None
+            env0 = {**os.environ, "DISPLAY": ":0"}
+            try:
+                r = subprocess.run(
+                    ["xfconf-query", "-c", "xfce4-desktop", "-p",
+                     "/backdrop/screen0/monitor0/image-path"],
+                    env=env0, capture_output=True, text=True, timeout=2,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            except Exception:
+                pass
+            return None
+
+        applied_count = 0
+
+        # --- Tema GTK ---
+        gtk_theme = read_gsettings_d0("org.gnome.desktop.interface", "gtk-theme")
+        if gtk_theme:
+            if apply_gsettings_dn("org.gnome.desktop.interface", "gtk-theme", gtk_theme):
+                applied_count += 1
+                log.info("Tema GTK clonado: %s", gtk_theme)
+
+        # --- Tema de ícones ---
+        icon_theme = read_gsettings_d0("org.gnome.desktop.interface", "icon-theme")
+        if icon_theme:
+            if apply_gsettings_dn("org.gnome.desktop.interface", "icon-theme", icon_theme):
+                applied_count += 1
+                log.info("Tema de ícones clonado: %s", icon_theme)
+
+        # --- Fonte ---
+        font_name = read_gsettings_d0("org.gnome.desktop.interface", "font-name")
+        if font_name:
+            if apply_gsettings_dn("org.gnome.desktop.interface", "font-name", font_name):
+                applied_count += 1
+                log.info("Fonte clonada: %s", font_name)
+
+        # --- Tema de cursor ---
+        cursor_theme = read_gsettings_d0("org.gnome.desktop.interface", "cursor-theme")
+        if cursor_theme:
+            if apply_gsettings_dn("org.gnome.desktop.interface", "cursor-theme", cursor_theme):
+                applied_count += 1
+                log.info("Tema de cursor clonado: %s", cursor_theme)
+
+        # --- Variante de cor (claro/escuro) ---
+        color_scheme = read_gsettings_d0("org.gnome.desktop.interface", "color-scheme")
+        if color_scheme:
+            if apply_gsettings_dn("org.gnome.desktop.interface", "color-scheme", color_scheme):
+                applied_count += 1
+                log.info("Variante de cor clonada: %s", color_scheme)
+
+        # --- Papel de parede ---
+        wallpaper = read_gnome_wallpaper() or read_xfce_wallpaper()
+        if wallpaper and os.path.exists(wallpaper):
+            # feh é mais portátil que gsettings para Xvfb (não depende de schema instalado).
+            if shutil.which("feh"):
+                env_n = {**os.environ, "DISPLAY": self.display_name}
+                try:
+                    r = subprocess.run(
+                        ["feh", "--bg-scale", wallpaper],
+                        env=env_n, capture_output=True, text=True, timeout=3,
+                    )
+                    if r.returncode == 0:
+                        applied_count += 1
+                        log.info("Papel de parede clonado: %s", wallpaper)
+                    else:
+                        log.warning("feh falhou ao aplicar papel de parede: %s",
+                                    r.stderr.strip() or r.stdout.strip())
+                except Exception as exc:
+                    log.warning("Erro ao aplicar papel de parede via feh: %s", exc)
+            else:
+                log.debug("feh não disponível; papel de parede não aplicado (instale feh).")
+
+        if applied_count == 0:
+            log.warning("Nenhuma configuração visual foi clonada do display principal.")
+        else:
+            log.info("Aparência clonada do display principal: %d configuração(ões).", applied_count)
 
     def _open_initial_terminal(self, env):
         """Abre um terminal no display virtual.
@@ -807,6 +960,9 @@ root.mainloop()
                     break
                 except Exception:
                     continue
+
+        # Reaplica aparência do display0 no Xvfb recém-recriado (rotação).
+        self._clone_display0_appearance()
 
         # Abre terminal inicial
         self._open_initial_terminal(env)
