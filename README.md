@@ -73,36 +73,33 @@ Abre uma janela com o PIN, QR Code e checkbox "Permitir controle".
 ### Conexão Wi-Fi
 Celular e PC na mesma rede. O app descobre o PC automaticamente (mDNS).
 
-### Conexão USB
-Plugue o cabo com depuração USB ativa. O servidor faz o `adb reverse`
-sozinho — só toque em "Via cabo (USB)" no app.
+### Conexão USB (Ancoragem USB — recomendada para menos lag)
+Plugue o cabo e ative **Ancoragem USB** nas configurações do celular
+(Configurações → Rede e Internet → Ponto de acesso e ancoragem →
+Ancoragem USB). O PC não precisa fazer nada — o próprio celular acha o
+servidor automaticamente assim que a ancoragem liga. Depois é só tocar em
+"Via cabo (USB)" no app.
 
-> **Se o celular tiver "Depuração sem fio" (wireless debugging) ligada ao
-> mesmo tempo do cabo**, o `adb` enxerga dois dispositivos ao mesmo tempo
-> e recusa comandos ambíguos — isso já é tratado automaticamente pelo
-> servidor (ele aplica o `adb reverse` em cada dispositivo autorizado,
-> não só "no primeiro que aparecer"). Se ainda assim não conectar, veja
-> a seção **Solução de problemas** abaixo.
+> **Por que Ancoragem USB e não Depuração USB?** A Ancoragem cria uma
+> interface de rede IP de verdade sobre o cabo (como se fosse um Wi-Fi a
+> mais, só que via USB), então o vídeo consegue usar UDP nativamente —
+> bem menos lag do que tunelar tudo por dentro do protocolo do `adb`
+> (que só suporta TCP e adiciona uma camada extra de overhead).
 
 ### Solução de problemas — "Via cabo" não conecta
 
-1. Confirme que a depuração USB está **autorizada** no celular (aparece
-   uma caixa de diálogo na primeira vez que você pluga o cabo em um PC
-   novo — toque em "Permitir").
-2. Na janela do servidor no PC, olhe o texto "Cabo USB: ...":
-   - **"plugue e autorize depuração"** → o PC não está vendo nenhum
-     celular. Tente outro cabo/porta USB (alguns cabos são só de
-     carregamento, sem dados).
-   - **"autorize a depuração no celular"** → o PC já vê o aparelho, mas
-     ele ainda não foi autorizado. Olhe a tela do celular.
-   - **"erro ao aplicar adb reverse"** → normalmente falta o pacote
-     `adb` no PC. Instale com `sudo apt install android-tools-adb`
-     (Debian/Ubuntu) ou `sudo dnf install android-tools` (Fedora).
-   - **"pronto ✅"** → está tudo certo do lado do PC; toque em "Via cabo
-     (USB)" no app.
-3. Se nada disso resolver, feche o app no celular, desconecte e
-   reconecte o cabo, e espere uns 5 segundos antes de abrir o app de
-   novo (o servidor verifica dispositivos a cada 3 segundos).
+1. Confirme que a **Ancoragem USB** está ativa nas configurações de rede
+   do celular (não é a mesma opção que "Depuração USB"/"Opções do
+   desenvolvedor" — é em Rede e Internet → Ponto de acesso e ancoragem).
+2. Tente outro cabo/porta USB — alguns cabos são só de carregamento, sem
+   dados, e a Ancoragem USB não aparece como opção nesse caso.
+3. Se o app mostrar "PC não encontrado no cabo", espere alguns segundos
+   (o celular varre a rede criada pela ancoragem procurando o servidor) e
+   tente de novo em "Via cabo (USB)".
+4. Se nada disso resolver, desligue e ligue a Ancoragem USB de novo nas
+   configurações do celular, e confira se o Firewall do PC não está
+   bloqueando a porta 8765 na interface USB (`usb0`/`enp0s...` — o nome
+   varia por distro).
 
 ## Modo Estender (segunda tela — igual SpaceDesk)
 

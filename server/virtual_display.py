@@ -168,6 +168,14 @@ class XvfbVirtualDisplay:
         # abaixo (precisa de uma janela já mapeada no display).
         self._start_x2x()
 
+        # Clona aparência do display principal em segundo plano (com
+        # retry — ver _clone_display0_appearance_with_retry). Roda
+        # assíncrono de propósito: a versão síncrona anterior tinha sido
+        # removida por deixar a conexão lenta; rodando em background, ela
+        # não atrasa mais nada, e o retry resolve o "às vezes clona, às
+        # vezes não" causado por timing (WM ainda não pronto no 1º try).
+        self._clone_display0_appearance_async()
+
         # Inicia captura (thread, não processo — sem leak de memória compartilhada)
         self._start_capture_thread()
 
@@ -524,6 +532,39 @@ class XvfbVirtualDisplay:
             )
         else:
             log.info("Aparência clonada do display principal: %d configuração(ões).", applied_count)
+
+        return applied_wallpaper
+
+    def _clone_display0_appearance_with_retry(self, max_attempts: int = 3, delay: float = 1.0) -> bool:
+        """Roda `_clone_display0_appearance()` com novas tentativas se o
+        papel de parede não for aplicado de primeira.
+
+        Essa é a causa mais provável do "às vezes clona, às vezes não":
+        logo após o terminal abrir, o WM e a sessão gráfica do display
+        virtual podem ainda não estar 100% prontos no exato instante em que
+        a clonagem roda pela primeira vez (timing race, não um erro fixo) —
+        então tentar de novo 1-2 vezes com um intervalo curto resolve sem
+        precisar de um sleep fixo mais longo (que só atrasaria a conexão
+        sempre, mesmo quando não precisa).
+        """
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if self._clone_display0_appearance():
+                    return True
+            except Exception as exc:
+                log.warning("Tentativa %d de clonar aparência falhou: %s", attempt, exc)
+            if attempt < max_attempts:
+                time.sleep(delay)
+        return False
+
+    def _clone_display0_appearance_async(self):
+        """Dispara a clonagem (com retry) em background — não atrasa o
+        start()/resize() do display virtual, que é justamente o motivo pelo
+        qual a clonagem automática tinha sido removida (ficava lenta/
+        bloqueando a conexão)."""
+        threading.Thread(
+            target=self._clone_display0_appearance_with_retry, daemon=True
+        ).start()
 
     def _open_initial_terminal(self, env):
         """Abre um terminal no display virtual.
@@ -1124,9 +1165,12 @@ root.mainloop()
         # display que não existe mais).
         self._start_x2x()
 
-        # Clonagem automática de aparência removida no resize — use o
-        # botão "Clonar aparência para o Display 2" na aba Sistema.
-        # self._clone_display0_appearance()
+        # Reaplica aparência do display0 no Xvfb recém-recriado (rotação),
+        # em segundo plano com retry — mesmo motivo do start() inicial. É
+        # essencial aqui: o resize() recria o Xvfb do zero (root window em
+        # branco de novo), então sem isso o papel de parede sempre some
+        # depois de girar a tela.
+        self._clone_display0_appearance_async()
 
         # Reinicia captura
         self._start_capture_thread()

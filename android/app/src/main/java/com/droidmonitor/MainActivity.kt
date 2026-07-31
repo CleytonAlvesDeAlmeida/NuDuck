@@ -277,8 +277,8 @@ fun DiscoveryScreen(
             Spacer(modifier = Modifier.height(16.dp))
 
             // Formas alternativas de conectar: ler o QR Code do PC ou usar cabo USB
-            // (o servidor já aplica "adb reverse tcp:8765 tcp:8765" sozinho, assim
-            // que detecta o celular com depuração USB autorizada). Em telas largas os
+            // (Ancoragem USB — o celular acha o PC sozinho varrendo o subnet
+            // criado pela ancoragem, ver UsbConnectionMonitor). Em telas largas os
             // botões ficam mais compactos (não esticam a largura toda) para não
             // parecerem gigantes ao lado da lista de PCs.
             Row(

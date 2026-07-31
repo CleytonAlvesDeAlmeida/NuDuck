@@ -8,3 +8,4 @@ zeroconf>=0.131
 qrcode[pil]>=7.4
 opencv-python-headless>=4.8
 cryptography>=42
+PyJWT>=2.8,<3

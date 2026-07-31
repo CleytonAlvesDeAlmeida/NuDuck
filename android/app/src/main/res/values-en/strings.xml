@@ -29,6 +29,7 @@
     <string name="error_dismiss">Back</string>
     <string name="mode_fallback_notice">"Extend" isn\'t available on this PC — connected in Mirror mode instead.</string>
     <string name="pc_via_cable">PC via cable (USB)</string>
+    <string name="usb_pc_not_found">PC not found over cable. Enable USB tethering in your phone settings and wait a few seconds.</string>
     <string name="pc_via_qrcode">PC via QR Code</string>
     <string name="qr_invalid">Invalid QR Code. Scan the code shown by NuDuck Server.</string>
     <string name="pin_too_many_attempts">Too many wrong PIN attempts. Try again shortly.</string>

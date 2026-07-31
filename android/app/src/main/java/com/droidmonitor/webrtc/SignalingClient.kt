@@ -139,8 +139,11 @@ class SignalingClient(
     fun sendQrToken(token: String) {
         send(JSONObject().apply {
             put("type", "qr_token")
-            // Reanexa o prefixo ND1. antes de enviar para o server validar.
-            put("token", "ND1.${token}")
+            // O token já vem completo ("ND1.<host_b64>.<blob_b64>") desde
+            // onQrCodeScanned — NÃO reanexar "ND1." aqui de novo, senão o
+            // pedaço do host no meio se perde e o server rejeita o token
+            // por formato inválido (era exatamente esse o bug).
+            put("token", token)
         })
     }
 

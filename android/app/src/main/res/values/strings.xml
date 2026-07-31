@@ -29,6 +29,7 @@
     <string name="error_dismiss">Voltar</string>
     <string name="mode_fallback_notice">"Estender" não disponível neste PC — conectado em modo Espelhar.</string>
     <string name="pc_via_cable">PC via cabo (USB)</string>
+    <string name="usb_pc_not_found">PC não encontrado no cabo. Ative a Ancoragem USB nas configurações do celular e aguarde alguns segundos.</string>
     <string name="pc_via_qrcode">PC via QR Code</string>
     <string name="qr_invalid">QR Code inválido. Escaneie o código exibido pelo NuDuck Server.</string>
     <string name="pin_too_many_attempts">Muitas tentativas de PIN erradas. Tente novamente em instantes.</string>

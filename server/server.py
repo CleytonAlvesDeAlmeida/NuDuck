@@ -42,7 +42,6 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
-from PIL import Image, ImageDraw
 from zeroconf import ServiceInfo, Zeroconf
 import cv2
 
@@ -203,7 +202,6 @@ class AppState:
     pin: str = field(default_factory=lambda: "".join(secrets.choice("0123456789") for _ in range(PIN_LENGTH)))
     allow_control: bool = False
     quality: str = DEFAULT_QUALITY
-    usb_status: str = "checking"
     failed_attempts: dict = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     # Modo espelhar janela: ID da janela selecionada (window_id do xdotool)
@@ -569,8 +567,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
             self._load_ema = None
             log.info("Automático: subiu para %s", QUALITY_ORDER[self._auto_idx])
 
-    def _draw_cursor(self, pil_img):
-        """Desenha um cursor de seta na posição do mouse."""
+    def _draw_cursor(self, img_bgr):
+        """Desenha um cursor de seta na posição do mouse, direto no array
+        BGR (numpy) via cv2 — ver nota de performance em _draw_cursor_arrow."""
         try:
             cx, cy = pyautogui.position()
         except Exception:
@@ -583,13 +582,23 @@ class ScreenCaptureTrack(VideoStreamTrack):
         if not (0 <= rel_x < src_w and 0 <= rel_y < src_h):
             return  # cursor em outro monitor
 
-        self._draw_cursor_arrow(pil_img, rel_x, rel_y, src_w, src_h)
+        self._draw_cursor_arrow(img_bgr, rel_x, rel_y, src_w, src_h)
 
-    def _draw_cursor_arrow(self, pil_img, cursor_x, cursor_y, src_w, src_h):
+    def _draw_cursor_arrow(self, img_bgr, cursor_x, cursor_y, src_w, src_h):
         """Desenha uma seta de cursor em (cursor_x, cursor_y) do frame original.
 
+        Trabalha direto no array BGR (numpy) via cv2.fillPoly/polylines, em
+        vez de converter pra PIL só pra desenhar a seta. Antes, TODO frame
+        (não só quando ia desenhar cursor) passava por
+        BGR→RGB→PIL→numpy→BGR — duas conversões de canal (cvtColor) e duas
+        cópias completas do buffer, a cada frame, no fps alvo inteiro. Isso
+        é custo de CPU/RAM real e evitável: agora o pipeline inteiro fica
+        em BGR/numpy do início ao fim, e só usamos cv2 (que já opera sobre
+        o buffer existente, sem alocar uma cópia num formato diferente).
+
         Parâmetros:
-            pil_img:    imagem PIL (já redimensionada para o target)
+            img_bgr:    array numpy BGR (já redimensionado para o target),
+                        modificado in-place.
             cursor_x:   posição X do cursor no display original (pixels)
             cursor_y:   posição Y do cursor no display original (pixels)
             src_w:      largura do display original (pixels)
@@ -598,25 +607,27 @@ class ScreenCaptureTrack(VideoStreamTrack):
         if not (0 <= cursor_x < src_w and 0 <= cursor_y < src_h):
             return  # cursor fora da área
 
-        scale = pil_img.height / src_h
+        img_h = img_bgr.shape[0]
+        scale = img_h / src_h
         x = cursor_x * scale
         y = cursor_y * scale
 
-        s = max(10, int(pil_img.height * 0.035))
-        points = [
+        s = max(10, int(img_h * 0.035))
+        points = np.array([
             (x, y), (x, y + s),
             (x + s * 0.35, y + s * 0.75), (x + s * 0.55, y + s * 1.0),
             (x + s * 0.72, y + s * 0.88), (x + s * 0.5, y + s * 0.6),
             (x + s * 0.85, y + s * 0.52),
-        ]
-        draw = ImageDraw.Draw(pil_img)
-        draw.polygon(points, fill=(255, 255, 255), outline=(0, 0, 0))
+        ], dtype=np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(img_bgr, [points], (255, 255, 255))
+        cv2.polylines(img_bgr, [points], isClosed=True, color=(0, 0, 0),
+                       thickness=1, lineType=cv2.LINE_AA)
 
-    def _draw_cursor_virtual(self, pil_img, src_w, src_h):
+    def _draw_cursor_virtual(self, img_bgr, src_w, src_h):
         """Desenha o cursor no display virtual Xvfb.
 
         Usa xdotool getmouselocation no DISPLAY do Xvfb para pegar a
-        posição do mouse e desenha a seta sobre o frame.
+        posição do mouse e desenha a seta sobre o frame (direto em BGR).
         """
         if not self._virtual_display or not self._virtual_display.is_running():
             return
@@ -625,50 +636,44 @@ class ScreenCaptureTrack(VideoStreamTrack):
             if pos is None:
                 return
             cx, cy = pos
-            self._draw_cursor_arrow(pil_img, cx, cy, src_w, src_h)
+            self._draw_cursor_arrow(img_bgr, cx, cy, src_w, src_h)
         except Exception:
             pass
 
-    def _letterbox(self, pil_img):
+    def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
         resolução do celular, sem cortar nenhuma parte da imagem.
 
-        Se as dimensões do celular não forem conhecidas, retorna a imagem
+        Versão cv2/numpy (opera em BGR) — antes era feita em PIL, exigindo
+        mais uma conversão de canal + cópia completa do frame. Se as
+        dimensões do celular não forem conhecidas, retorna a imagem
         original sem alteração.
         """
         if not self._phone_w or not self._phone_h:
-            return pil_img
+            return img_bgr
 
         phone_w, phone_h = self._phone_w, self._phone_h
-        img_w, img_h = pil_img.size
+        img_h, img_w = img_bgr.shape[:2]
 
         # Se a imagem já tem o aspect ratio do celular, só redimensiona
         if abs(img_w / img_h - phone_w / phone_h) < 0.02:
-            return pil_img.resize((phone_w, phone_h), Image.BILINEAR)
+            return cv2.resize(img_bgr, (phone_w, phone_h), interpolation=cv2.INTER_LINEAR)
 
         # Calcula escala para caber dentro da tela do celular
         scale = min(phone_w / img_w, phone_h / img_h)
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
+        new_w = max(1, int(img_w * scale))
+        new_h = max(1, int(img_h * scale))
 
         # Redimensiona mantendo proporção
-        resized = pil_img.resize((new_w, new_h), Image.BILINEAR)
+        resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        # Cria canvas preto nas dimensões do celular
-        canvas = Image.new("RGB", (phone_w, phone_h), (0, 0, 0))
-
-        # Centraliza a imagem no canvas
+        # Cria canvas preto nas dimensões do celular e centraliza
+        canvas = np.zeros((phone_h, phone_w, 3), dtype=np.uint8)
         x_offset = (phone_w - new_w) // 2
         y_offset = (phone_h - new_h) // 2
-        canvas.paste(resized, (x_offset, y_offset))
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
 
         return canvas
-
-    def _resample_filter(self, target_h: int) -> int:
-        """Filtro de reamostragem: NEAREST (mais leve) para as qualidades mais
-        baixas, onde a perda de nitidez é imperceptível e a economia de CPU
-        ajuda hardware fraco; BILINEAR (mais suave) do 480p pra cima."""
-        return Image.NEAREST if target_h <= 240 else Image.BILINEAR
 
     def _aligned_dimensions(self, src_w: int, src_h: int, target_h: int) -> tuple:
         """Calcula (largura, altura) de saída arredondadas para múltiplos de 16px.
@@ -696,16 +701,12 @@ class ScreenCaptureTrack(VideoStreamTrack):
           2. Janela (window): captura apenas uma janela específica
           3. Normal (mirror): captura monitor principal com mss
 
-        Nota BGR: mss/Xvfb/capture_window entregam BGR. PIL.Image.fromarray()
-        num array BGR cria uma imagem PIL com canais "BGR" — mas PIL sempre
-        interpreta como RGB. No entanto, ao passar de volta para numpy e
-        usar VideoFrame.from_ndarray(..., format="bgr24"), os canais são
-        interpretados como BGR. Então o ciclo BGR→PIL(BGR interpretado como
-        RGB)→numpy→bgr24 resulta em cores trocadas (R↔B).
-
-        Solução: Usar cv2.resize (opera em BGR nativamente) para o resize
-        inicial, e só converter para PIL para desenhar o cursor (operação
-        que não depende de cor). Depois volta para BGR numpy.
+        O pipeline inteiro fica em BGR/numpy do início (mss/Xvfb já
+        entregam BGR) ao fim (VideoFrame.from_ndarray(..., format="bgr24")
+        espera BGR) — sem nenhuma parada em PIL no meio. Isso evita duas
+        conversões de canal (cvtColor) e duas cópias completas do frame
+        que rodavam TODO frame só para poder usar ImageDraw/Image.resize
+        (ver _draw_cursor_arrow/_letterbox para o detalhe).
         """
 
         # --- Caminho 1: Display virtual Xvfb (modo Estender) ---
@@ -715,35 +716,26 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 src_h, src_w = frame_bgr.shape[:2]
                 target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-                # Usa cv2.resize diretamente em BGR (sem conversão de canais).
                 # Item 9: em low_latency, INTER_NEAREST é mais rápido (custo de nitidez).
                 interp = cv2.INTER_NEAREST if self._is_low_latency else (
                     cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
                 )
                 frame_resized = cv2.resize(frame_bgr, (target_w, target_h), interpolation=interp)
 
-                # Converte para PIL apenas para desenhar o cursor
-                # cv2 BGR -> PIL RGB (cvtColor): B,G,R -> R,G,B
-                frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(frame_rgb)
-
                 # Desenha cursor do mouse no display virtual (Xvfb não renderiza cursor).
                 # Item 9: em low_latency, pula o cursor (corta 5-10ms por frame).
                 if not self._is_low_latency:
-                    self._draw_cursor_virtual(pil_img, src_w, src_h)
+                    self._draw_cursor_virtual(frame_resized, src_w, src_h)
 
                 # Adaptar à resolução do celular se conhecida
                 if self._phone_w and self._phone_h:
                     phone_w, phone_h = self._phone_w, self._phone_h
                     a_phone_w = max(16, round(phone_w / 16) * 16)
                     a_phone_h = max(16, round(phone_h / 16) * 16)
-                    pil_img = self._letterbox(pil_img)
-                    pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
+                    frame_resized = self._letterbox(frame_resized)
+                    frame_resized = cv2.resize(frame_resized, (a_phone_w, a_phone_h), interpolation=cv2.INTER_LINEAR)
 
-                # PIL RGB -> numpy RGB -> cv2 BGR para o VideoFrame
-                out_rgb = np.ascontiguousarray(np.array(pil_img))
-                out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-                return VideoFrame.from_ndarray(out_bgr, format="bgr24")
+                return VideoFrame.from_ndarray(np.ascontiguousarray(frame_resized), format="bgr24")
 
             # get_frame() retornou None (não deveria acontecer mais)
             log.warning("get_frame() retornou None, gerando frame de fallback")
@@ -796,33 +788,25 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # aspect ratio realmente não bate com o do celular.
         target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-        # Usa cv2.resize em BGR
         # Item 9: em low_latency, sempre INTER_NEAREST (mais rápido).
         interp = cv2.INTER_NEAREST if self._is_low_latency else (
             cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
         )
         frame_resized = cv2.resize(img, (target_w, target_h), interpolation=interp)
 
-        # BGR -> RGB para PIL (cursor)
-        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
-
         # Item 9: em low_latency, pula desenho do cursor.
         if not self._is_low_latency:
-            self._draw_cursor(pil_img)
+            self._draw_cursor(frame_resized)
 
         # Adaptar à resolução do celular se conhecida
         if self._phone_w and self._phone_h:
             phone_w, phone_h = self._phone_w, self._phone_h
             a_phone_w = max(16, round(phone_w / 16) * 16)
             a_phone_h = max(16, round(phone_h / 16) * 16)
-            pil_img = self._letterbox(pil_img)
-            pil_img = pil_img.resize((a_phone_w, a_phone_h), Image.BILINEAR)
+            frame_resized = self._letterbox(frame_resized)
+            frame_resized = cv2.resize(frame_resized, (a_phone_w, a_phone_h), interpolation=cv2.INTER_LINEAR)
 
-        # PIL RGB -> BGR para VideoFrame
-        out_rgb = np.ascontiguousarray(np.array(pil_img))
-        out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-        return VideoFrame.from_ndarray(out_bgr, format="bgr24")
+        return VideoFrame.from_ndarray(np.ascontiguousarray(frame_resized), format="bgr24")
 
     async def recv(self):
         if self._start_time is None:
@@ -1446,92 +1430,20 @@ def _execute_shortcut_command(command: str):
 
 
 # ==========================================================================
-# USB (ADB reverse automático — sem comando no terminal)
+# USB — Ancoragem USB (não Depuração/adb reverse)
 # ==========================================================================
-
-USB_STATUS_LABELS = {
-    "checking":     ("Cabo USB: verificando...", "gray"),
-    "connected":    ("Cabo USB: pronto ✅", "#2e7d32"),
-    "no_device":    ("Cabo USB: plugue e autorize depuração", "gray"),
-    "unauthorized": ("Cabo USB: autorize a depuração no celular", "#b26a00"),
-    "adb_missing":  ("Cabo USB: 'adb' não encontrado", "gray"),
-    "error":        ("Cabo USB: erro ao aplicar adb reverse", "#c62828"),
-}
-
-
-def _parse_adb_devices(output: str) -> tuple[list[str], list[str]]:
-    """Extrai (seriais_autorizados, seriais_nao_autorizados) da saída de `adb devices`."""
-    ready: list[str] = []
-    unauthorized: list[str] = []
-    for line in output.splitlines()[1:]:  # primeira linha é o cabeçalho "List of devices attached"
-        line = line.strip()
-        if not line or line.startswith("*"):
-            continue
-        parts = line.split("\t")
-        if len(parts) != 2:
-            continue
-        serial, state = parts[0].strip(), parts[1].strip()
-        if not serial:
-            continue
-        if state == "device":
-            ready.append(serial)
-        elif state == "unauthorized":
-            unauthorized.append(serial)
-    return ready, unauthorized
-
-
-def _adb_reverse_loop():
-    """Verifica se tem celular plugado e aplica `adb reverse` sozinho.
-
-    Importante: o comando precisa mirar um serial específico (`adb -s <serial>
-    reverse ...`). Sem isso, o adb recusa a operação com "error: more than one
-    device/emulator" sempre que há mais de um dispositivo visível — o que é
-    comum mesmo com só o cabo plugado, pois muitos celulares recentes têm
-    "depuração sem fio" (adb por Wi-Fi) habilitada ao mesmo tempo, ou o PC
-    tem um emulador/outro aparelho já pareado. Esse era o motivo do botão
-    "Via cabo" às vezes não funcionar: o `adb reverse` global falhava
-    silenciosamente e o app tentava conversar com um servidor que não
-    existia em 127.0.0.1.
-    """
-    adb = shutil.which("adb")
-    if adb is None:
-        log.info("adb não encontrado; modo USB desativado.")
-        STATE.usb_status = "adb_missing"
-        return
-
-    while True:
-        try:
-            result = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=5)
-            ready, unauthorized = _parse_adb_devices(result.stdout)
-
-            if ready:
-                any_ok = False
-                for serial in ready:
-                    rev = subprocess.run(
-                        [adb, "-s", serial, "reverse", f"tcp:{PORT}", f"tcp:{PORT}"],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    if rev.returncode == 0:
-                        any_ok = True
-                    else:
-                        log.warning(
-                            "adb reverse falhou para %s: %s",
-                            serial, rev.stderr.strip() or rev.stdout.strip(),
-                        )
-                STATE.usb_status = "connected" if any_ok else "error"
-            elif unauthorized:
-                STATE.usb_status = "unauthorized"
-            else:
-                STATE.usb_status = "no_device"
-        except Exception as exc:
-            log.warning("Erro ao verificar dispositivos USB: %s", exc)
-            STATE.usb_status = "error"
-
-        time.sleep(3)
-
-
-def start_usb_autoforward():
-    threading.Thread(target=_adb_reverse_loop, daemon=True).start()
+# O PC não precisa fazer NADA de especial para a conexão via cabo funcionar
+# mais. A versão anterior usava Depuração USB (`adb reverse`): um loop aqui
+# no server rodando `adb devices`/`adb reverse` a cada poucos segundos,
+# consumindo CPU o tempo todo, mesmo sem nenhum celular plugado.
+#
+# Trocamos para Ancoragem USB (USB tethering): o celular cria uma interface
+# de rede IP de verdade sobre o cabo (o mesmo tipo de link do Wi-Fi), e o
+# NuDuck Server já escuta em todas as interfaces (0.0.0.0) — então o cabo
+# funciona automaticamente assim que o celular ativa a Ancoragem USB nas
+# configurações dele, sem o PC precisar rodar nada, sem adb, sem loop.
+# Quem faz o trabalho de achar o IP do PC no cabo é o app (celular), que
+# varre o pequeno subnet criado pela ancoragem — ver UsbConnectionMonitor.kt.
 
 
 # ==========================================================================
@@ -1590,9 +1502,19 @@ def start_mdns(hostname: str) -> Zeroconf:
 #   ND1.<base64url(host:port)>.<base64url(nonce_12B || ciphertext || tag_16B)>
 # Onde:
 #   - ND1 = prefixo do formato (NuDuck versão 1)
-#   - host:port = IP e porta do servidor (text, base64url)
-#   - O ciphertext criptografa o JSON: {"pin": "...", "exp": <epoch_ms>,
-#     "nonce": "<uuid4>"}
+#   - host:port = IP e porta do servidor (texto, base64url)
+#   - O ciphertext criptografa (AES-256-GCM) um JWT assinado (HS256), não
+#     mais um JSON cru. Claims do JWT: {"pin", "exp", "iat", "jti"}.
+#     Duas camadas de proteção, cada uma cobrindo o que a outra não cobre:
+#       - AES-GCM (fora): confidencialidade — sem a chave do server,
+#         ninguém lê o conteúdo, nem que o QR seja fotografado por outra
+#         pessoa/app.
+#       - JWT/HS256 (dentro): integridade + expiração no formato padrão —
+#         `exp` é validado pela própria biblioteca PyJWT na decodificação
+#         (rejeita token expirado antes mesmo de olhar os claims), e a
+#         assinatura HMAC garante que o payload não foi adulterado mesmo
+#         que alguém descobrisse uma forma de recriar um blob AES-GCM
+#         válido (defesa em profundidade).
 
 QR_TOKEN_VERSION = "ND1"
 QR_TOKEN_TTL_SECONDS = 30  # Validade do token
@@ -1648,11 +1570,22 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
+def _get_jwt_secret_key() -> str:
+    """Chave de assinatura HS256 do JWT — reaproveita a mesma chave AES
+    persistente (32 bytes), só que em hex, pra não precisar gerenciar dois
+    arquivos de segredo separados. Rotacionar qr_secret.key invalida os
+    dois (AES e JWT) ao mesmo tempo, o que é o comportamento certo.
+    """
+    return _get_qr_secret_key().hex()
+
+
 def _build_qr_token_payload() -> str:
     """Gera o payload criptografado do QR: ND1.<b64(host:port)>.<b64(ciphertext)>.
 
-    O ciphertext criptografa JSON {"pin","exp","nonce"} com AES-256-GCM,
-    chave persistente do server, nonce aleatório de 12 bytes.
+    O ciphertext criptografa (AES-256-GCM) um JWT assinado (HS256) — não
+    mais um JSON cru. O JWT carrega os claims padrão `exp`/`iat` (a
+    biblioteca PyJWT já valida `exp` sozinha na decodificação) mais `pin`
+    e `jti` (nonce, para diferenciar tokens gerados no mesmo segundo).
 
     O PIN expira em QR_TOKEN_TTL_SECONDS.
     """
@@ -1671,12 +1604,22 @@ def _build_qr_token_payload() -> str:
     host_port = f"{get_local_ip()}:{PORT}"
     host_port_b64 = _b64url_encode(host_port.encode("utf-8"))
 
-    payload = _json.dumps({
+    now = time.time()
+    claims = {
         "v": 1,
         "pin": STATE.pin,
-        "nonce": secrets.token_hex(8),  # nonce interno, para invalidar tokens antigos
-        "exp": int((time.time() + QR_TOKEN_TTL_SECONDS) * 1000),  # epoch_ms
-    }, separators=(",", ":"))
+        "jti": secrets.token_hex(8),  # nonce interno, para diferenciar tokens
+        "iat": int(now),
+        "exp": int(now + QR_TOKEN_TTL_SECONDS),
+    }
+
+    try:
+        import jwt as pyjwt
+        payload = pyjwt.encode(claims, _get_jwt_secret_key(), algorithm="HS256")
+    except ImportError:
+        log.warning("PyJWT não instalado — token QR sem a camada JWT (só AES-GCM). "
+                     "Instale: pip install PyJWT")
+        payload = _json.dumps(claims, separators=(",", ":"))
 
     aesgcm = AESGCM(_get_qr_secret_key())
     nonce = secrets.token_bytes(12)  # nonce AES-GCM (12 bytes recomendado)
@@ -1691,8 +1634,10 @@ def _validate_qr_token(token: str) -> tuple[bool, str]:
     """Valida um token ND1 recebido do app.
 
     Retorna (sucesso, pin). Em caso de falha, retorna (False, "").
-    Sucesso significa: token bem formado, decriptado com a chave certa, e
-    dentro do prazo de validade.
+    Sucesso significa: token bem formado, decriptado com a chave AES certa,
+    JWT com assinatura válida, e dentro do prazo de validade (checado duas
+    vezes: pelo PyJWT via `exp` do JWT, e pelo AES-GCM em si não expirar
+    nada — a expiração real é sempre a do JWT).
     """
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -1709,7 +1654,7 @@ def _validate_qr_token(token: str) -> tuple[bool, str]:
 
     _, _host_b64, blob_b64 = parts
 
-    # Decifra.
+    # Decifra a camada AES-GCM.
     try:
         blob = _b64url_decode(blob_b64)
         if len(blob) < 12 + 16:  # nonce(12) + tag(16)
@@ -1717,17 +1662,30 @@ def _validate_qr_token(token: str) -> tuple[bool, str]:
         nonce = blob[:12]
         ciphertext = blob[12:]
         aesgcm = AESGCM(_get_qr_secret_key())
-        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-        data = _json.loads(plaintext.decode("utf-8"))
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
     except Exception as exc:
-        log.warning("Token QR inválido (decriptação falhou): %s", exc)
+        log.warning("Token QR inválido (decriptação AES-GCM falhou): %s", exc)
         return False, ""
 
-    # Verifica expiração.
-    exp_ms = data.get("exp", 0)
-    now_ms = int(time.time() * 1000)
-    if now_ms > exp_ms:
-        log.warning("Token QR expirado (exp=%d, now=%d).", exp_ms, now_ms)
+    # Decodifica e valida a camada JWT (assinatura + exp).
+    try:
+        import jwt as pyjwt
+        data = pyjwt.decode(plaintext, _get_jwt_secret_key(), algorithms=["HS256"])
+    except ImportError:
+        # PyJWT não instalado no server: aceita o payload como JSON puro
+        # (mesmo fallback usado em _build_qr_token_payload quando faltava
+        # PyJWT na geração) — mantém compatibilidade, mas sem a camada JWT.
+        try:
+            data = _json.loads(plaintext)
+        except Exception:
+            return False, ""
+        now_s = time.time()
+        if now_s > data.get("exp", 0):
+            log.warning("Token QR expirado (sem PyJWT).")
+            return False, ""
+    except Exception as exc:
+        # Cobre jwt.ExpiredSignatureError, jwt.InvalidSignatureError, etc.
+        log.warning("Token QR com JWT inválido/expirado: %s", exc)
         return False, ""
 
     # Verifica versão.
@@ -2267,17 +2225,11 @@ def start_ui(hostname: str):
         _section_label(tab_system, "Status")
 
         usb_label = tk.Label(
-            tab_system, text="Cabo USB: verificando...", font=("Sans", 9),
-            bg=BG_CARD, fg=FG_MUTED, anchor="w",
+            tab_system,
+            text="Cabo USB: ative a Ancoragem USB nas configurações do celular (não precisa fazer nada aqui no PC).",
+            font=("Sans", 9), bg=BG_CARD, fg=FG_MUTED, anchor="w", justify="left", wraplength=280,
         )
         usb_label.pack(fill="x", pady=(0, 12))
-
-        def poll_usb():
-            text, color = USB_STATUS_LABELS.get(STATE.usb_status, USB_STATUS_LABELS["checking"])
-            usb_label.config(text=text, fg=color)
-            root.after(1500, poll_usb)
-
-        poll_usb()
 
         _section_label(tab_system, "Diagnóstico")
         _flat_button(tab_system, "Ver terminal", open_log_viewer).pack(fill="x", pady=(0, 16))
@@ -2327,7 +2279,7 @@ def start_ui(hostname: str):
                 # 1) Reaplica a lógica já existente (mais robusta: dconf +
                 #    gsettings + papel de parede via feh + fallback de cor).
                 try:
-                    vd._clone_display0_appearance()
+                    vd._clone_display0_appearance_with_retry()
                     results.append("tema/papel de parede reaplicados")
                 except Exception as exc:
                     results.append(f"falha ao reaplicar tema ({exc})")
@@ -2485,8 +2437,6 @@ def main():
         start_ui(hostname)
     except Exception as exc:
         log.warning("Interface gráfica indisponível (%s); use o console.", exc)
-
-    start_usb_autoforward()
 
     zeroconf = start_mdns(hostname)
     app = build_app()

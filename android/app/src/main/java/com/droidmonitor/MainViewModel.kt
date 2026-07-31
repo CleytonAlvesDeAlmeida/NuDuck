@@ -65,7 +65,7 @@ data class UiState(
     val connectedPc: PcInfo? = null,
     /** PIN usado na conexão atual. */
     val connectedPin: String = "",
-    /** True quando há túnel USB ativo (adb reverse em 127.0.0.1:8765). */
+    /** True quando o PC foi encontrado via Ancoragem USB (ver [com.droidmonitor.usb.UsbConnectionMonitor]). */
     val usbTunnelActive: Boolean = false,
     /** Perfil de latência ativo: "standard" (Wi-Fi) ou "low_latency" (USB). */
     val latencyProfile: String = "standard",
@@ -108,9 +108,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var lastRootBackAt: Long = 0L
     private val ROOT_DOUBLE_BACK_THRESHOLD_MS = 2000L
 
-    // ---- Monitor de túnel USB (Item 8) ----
-    // Detecta se o adb reverse está ativo em 127.0.0.1:8765. Se sim, qualquer
-    // conexão QR é redirecionada para o cabo (ignora o IP do QRCode).
+    // ---- Monitor de Ancoragem USB (Item 8) ----
+    // Detecta se o PC foi encontrado via Ancoragem USB (varredura de subnet,
+    // ver UsbConnectionMonitor). Se sim, qualquer conexão QR é redirecionada
+    // para o cabo (ignora o IP do QRCode, que é da rede Wi-Fi).
     private val usbMonitor = com.droidmonitor.usb.UsbConnectionMonitor(application)
 
     init {
@@ -136,8 +137,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         mdnsDiscovery.start()
 
-        // Item 8: monitora túnel USB ativo. Quando ativo, o QR Code deve ser
-        // redirecionado para 127.0.0.1:8765 em vez do IP da LAN do QR.
+        // Item 8: monitora a Ancoragem USB. Quando o PC é encontrado no
+        // cabo, o QR Code deve ser redirecionado para o IP achado no
+        // subnet USB em vez do IP da LAN Wi-Fi do QR.
         usbMonitor.onStateChange = { active ->
             _uiState.update { it.copy(usbTunnelActive = active) }
         }
@@ -159,11 +161,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Conexão manual via USB: o servidor já aplica `adb reverse tcp:8765 tcp:8765`
-     *  sozinho assim que detecta o celular com depuração USB autorizada. */
+    /** Conexão manual via cabo (Ancoragem USB): usa o IP do PC já
+     *  encontrado pela varredura de subnet (ver [UsbConnectionMonitor]).
+     *  Se ainda não achou (cabo não plugado, ancoragem desligada, ou
+     *  varredura ainda rolando), mostra um erro orientando o usuário em
+     *  vez de tentar conectar num host que não existe. */
     fun connectViaCable() {
-        val name = getApplication<Application>().getString(R.string.pc_via_cable)
-        selectPc(PcInfo(name = name, host = "127.0.0.1", port = 8765))
+        val app = getApplication<Application>()
+        val host = usbMonitor.discoveredPcHost()
+        if (host == null) {
+            _uiState.update {
+                it.copy(screen = Screen.ConnectionError(app.getString(R.string.usb_pc_not_found)))
+            }
+            return
+        }
+        val name = app.getString(R.string.pc_via_cable)
+        selectPc(PcInfo(name = name, host = host, port = 8765))
     }
 
     fun openQrScan() {
@@ -217,8 +230,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      *    `{"host":"...","port":8765,"name":"...","pin":"123456"}`
      *    Mantido para servers antigos; recomenda-se atualizar o server.
      *
-     * Item 8: se o túnel USB estiver ativo (adb reverse em 127.0.0.1:8765),
-     * o IP do QR é ignorado e a conexão é forçada pelo cabo.
+     * Item 8: se o PC já foi encontrado via Ancoragem USB, o IP do QR é
+     * ignorado e a conexão é forçada pelo cabo (mais rápido, menos lag).
      */
     fun onQrCodeScanned(rawValue: String) {
         val app = getApplication<Application>()
@@ -257,9 +270,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val qrHost = hostMatch?.groupValues?.getOrNull(1) ?: ""
             val qrPort = hostMatch?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 8765
 
-            // ---- Item 8: prioriza cabo USB se túnel ativo ----
-            val (effectiveHost, effectivePort, viaUsb) = if (usbMonitor.isTunnelActive()) {
-                Triple("127.0.0.1", 8765, true)
+            // ---- Item 8: prioriza cabo USB se o PC já foi encontrado ----
+            val usbHost = usbMonitor.discoveredPcHost()
+            val (effectiveHost, effectivePort, viaUsb) = if (usbHost != null) {
+                Triple(usbHost, 8765, true)
             } else {
                 Triple(qrHost, qrPort, false)
             }
@@ -282,9 +296,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             // vazio e o botão "Conectar" desabilitado) e ainda desperdiçava
             // parte da janela de 30s de validade do token com o usuário
             // parado numa tela esperando digitar algo que não era necessário.
+            //
+            // Guarda o token ND1 INTEIRO (rawValue), não só sub[1]. O
+            // formato é "ND1.<host_b64>.<blob_b64>" (3 partes) — o server
+            // espera exatamente essas 3 partes pra validar. Guardar só o
+            // ciphertext e reanexar "ND1." na hora de enviar (como era
+            // antes) perdia o pedaço do host no meio, e o server rejeitava
+            // o token sempre por formato inválido — era por isso que a
+            // conexão via QR nunca completava e caía pro fluxo de PIN.
             _uiState.update {
                 it.copy(
-                    pendingQrToken = sub[1], // só o ciphertext (a parte cifrada)
+                    pendingQrToken = rawValue,
                     transientHint = if (viaUsb) "Conectando via cabo (USB)" else null,
                 )
             }
@@ -299,9 +321,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val json = org.json.JSONObject(rawValue)
             val qrHost = json.getString("host")
             val qrPort = json.optInt("port", 8765)
-            // Item 8: prioriza cabo se túnel USB ativo.
-            val (effectiveHost, effectivePort, viaUsb) = if (usbMonitor.isTunnelActive()) {
-                Triple("127.0.0.1", 8765, true)
+            // Item 8: prioriza cabo se o PC já foi encontrado via Ancoragem USB.
+            val usbHost = usbMonitor.discoveredPcHost()
+            val (effectiveHost, effectivePort, viaUsb) = if (usbHost != null) {
+                Triple(usbHost, 8765, true)
             } else {
                 Triple(qrHost, qrPort, false)
             }
@@ -334,8 +357,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun submitPin(pc: PcInfo, pin: String) {
         val mode = _uiState.value.screenMode
-        // Item 9: se conectando via USB (127.0.0.1) ou túnel ativo, ativa perfil LowLatency.
-        val viaUsb = pc.host == "127.0.0.1" || usbMonitor.isTunnelActive()
+        // Item 9: se conectando pelo host achado via Ancoragem USB, ativa
+        // o perfil de baixa latência.
+        val viaUsb = pc.host == usbMonitor.discoveredPcHost()
         val profile = if (viaUsb) "low_latency" else "standard"
         val pendingToken = _uiState.value.pendingQrToken
         _uiState.update {
