@@ -243,5 +243,10 @@ class SignalingClient(
         webSocket = null
         RemoteLog.detach(remoteLogSink)
         client.dispatcher.executorService.shutdown()
+        try {
+            client.dispatcher.executorService.awaitTermination(2, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            client.dispatcher.executorService.shutdownNow()
+        }
     }
 }

@@ -66,6 +66,10 @@ class XvfbVirtualDisplay:
         self.xvfb_process = None
         self.wm_process = None
         self._x2x_process = None
+        # Processos filhos abertos dentro do display virtual (terminal,
+        # launcher Tkinter, etc.) — rastreados para serem mortos no stop()
+        # e evitar processos órfãos.
+        self._child_processes: list = []
         # Captura via thread (evita leak de memória compartilhada do multiprocessing)
         self._capture_thread = None
         self._stop_event = None
@@ -591,12 +595,13 @@ class XvfbVirtualDisplay:
                     args = [term_name] + extra_args
                     if term_name == "gnome-terminal":
                         args += ["--"]
-                    subprocess.Popen(
+                    proc = subprocess.Popen(
                         args + ["/bin/bash"],
                         env=env,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
+                    self._child_processes.append(proc)
                     log.info("Terminal '%s' aberto em %s", term_name, self.display_name)
                     opened = True
                     break
@@ -650,12 +655,13 @@ hint.pack(pady=10)
 
 root.mainloop()
 '''
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 ["python3", "-c", script],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            self._child_processes.append(proc)
             log.info("Launcher Tkinter criado em %s", self.display_name)
         except Exception as exc:
             log.warning("Falha ao criar launcher Tkinter: %s", exc)
@@ -958,7 +964,7 @@ root.mainloop()
             return None
 
     def stop(self):
-        """Para o Xvfb, WM, captura e limpa os arquivos de socket."""
+        """Para o Xvfb, WM, captura, processos filhos e limpa os arquivos de socket."""
         log.info("Encerrando display virtual %s...", self.display_name)
 
         # Sinaliza parada da thread de captura
@@ -982,6 +988,19 @@ root.mainloop()
             except Exception:
                 pass
             self._mss_instance = None
+
+        # Mata processos filhos (terminal, launcher Tkinter, etc.)
+        for proc in self._child_processes:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        self._child_processes.clear()
 
         # Mata WM
         if self.wm_process:
@@ -1068,6 +1087,19 @@ root.mainloop()
             except Exception:
                 pass
             self._mss_instance = None
+
+        # Mata processos filhos (terminal, launcher, etc.)
+        for proc in self._child_processes:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        self._child_processes.clear()
 
         # Mata WM
         if self.wm_process:
