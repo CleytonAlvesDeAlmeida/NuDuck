@@ -18,6 +18,7 @@ Requisitos: ver requirements.txt + pacotes do sistema no README.
 """
 
 import asyncio
+import atexit
 import concurrent.futures
 import fractions
 import ipaddress
@@ -27,6 +28,7 @@ import os
 import queue
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1824,6 +1826,16 @@ def start_ui(hostname: str):
 
         def shutdown():
             log.info("Encerrando %s...", APP_NAME)
+            # BUG: antes chamava só os._exit(0) direto — isso mata o
+            # processo Python na hora, sem rodar nenhuma limpeza. Filhos
+            # como Xvfb, x2x, xterm e o WM (openbox/fluxbox/...) ficavam
+            # órfãos rodando pra sempre, mesmo com o server fechado. Para
+            # o display virtual ativo primeiro (isso já mata x2x/Xvfb/
+            # xterm/WM juntos, ver XvfbVirtualDisplay.stop()).
+            try:
+                stop_active_display()
+            except Exception as exc:
+                log.warning("Erro ao parar display virtual no shutdown: %s", exc)
             try:
                 root.destroy()
             except Exception:
@@ -2407,6 +2419,28 @@ def _port_available(port: int) -> bool:
 def main():
     hostname = socket.gethostname().split(".")[0]
 
+    # Rede de segurança extra pro bug do x2x/Xvfb ficando órfão: cobre os
+    # casos que não passam pelo botão "fechar janela" do Tkinter (matar o
+    # processo com Ctrl+C no terminal, `kill`, systemd parando o serviço,
+    # etc.). atexit cobre saída normal (`sys.exit`/fim do script); os
+    # handlers de sinal cobrem SIGTERM/SIGINT — sem eles, `os._exit(0)` ou
+    # um sinal não tratado matam o processo sem rodar nenhuma limpeza.
+    atexit.register(stop_active_display)
+
+    def _handle_signal(signum, _frame):
+        log.info("Sinal %s recebido — encerrando %s...", signum, APP_NAME)
+        try:
+            stop_active_display()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _handle_signal)
+        except Exception:
+            pass  # alguns sinais não são interceptáveis em certas plataformas
+
     if not _port_available(PORT):
         log.error("Porta %d em uso — outra instância do %s já está rodando.", PORT, APP_NAME)
         try:
@@ -2430,7 +2464,7 @@ def main():
     print(f"  PIN: {STATE.pin}")
     print(f"  Porta: {PORT}")
     print("  Wi-Fi: conecte pelo app na mesma rede.")
-    print("  USB:   plugue com depuração ativa.")
+    print("  USB:   ative a Ancoragem USB no celular.")
     print("=" * 50)
 
     try:
