@@ -256,6 +256,17 @@ vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
 
 ## Changelog
 
+### Atualização (01/08/2026) — Correção: erro de build no Codemagic
+- **Bug corrigido: `SharpUpscaleDrawer.kt` não compilava** (erro
+  `Cannot access 'GlGenericDrawer': it is package-private in
+  'org.webrtc'`). A causa foi eu ter usado uma classe interna da
+  biblioteca do WebRTC que não pode ser estendida por código de fora
+  dela. Reescrevi o arquivo inteiro implementando a interface pública
+  `RendererCommon.GlDrawer` diretamente, usando só OpenGL ES padrão do
+  Android — sem depender de nada interno do WebRTC. O comportamento
+  (ampliação + nitidez na GPU) continua o mesmo, só a implementação por
+  baixo dos panos mudou.
+
 ### Atualização (01/08/2026) — Correção: toque mapeado no lugar errado
 - **Bug corrigido: o cursor do mouse sempre ia para o canto
   inferior/direito da tela, não importava onde a pessoa tocasse.**
