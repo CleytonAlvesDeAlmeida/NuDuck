@@ -1408,36 +1408,8 @@ async def shortcuts_execute_handler(request: web.Request):
     return web.json_response({"ok": True, "executed": name})
 
 
-# Lista de processos de atalhos abertos pelo usuário — precisam ser
-# mortos ao encerrar o server para não ficarem órfãos.
-_shortcut_processes: list[subprocess.Popen] = []
-
-
-def _kill_shortcut_processes():
-    """Encerra todos os processos de atalhos abertos pelo usuário."""
-    if not _shortcut_processes:
-        return
-    count = len(_shortcut_processes)
-    for proc in _shortcut_processes:
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-    _shortcut_processes.clear()
-    log.info("Processos de atalhos encerrados (%d).", count)
-
-
 def _execute_shortcut_command(command: str):
-    """Executa um comando no displaydigital (Xvfb ativo).
-
-    O processo é rastreado e será encerrado automaticamente quando o
-    servidor fechar, evitando processos órfãos.
-    """
+    """Executa um comando no displaydigital (Xvfb ativo)."""
     vd = get_active_display()
     env = None
     if vd and vd.is_running() and vd.display_name:
@@ -1447,14 +1419,14 @@ def _execute_shortcut_command(command: str):
         log.info("Executando atalho no display principal: %s", command)
 
     try:
-        proc = subprocess.Popen(
+        subprocess.Popen(
             command,
             shell=True,
             env=env or os.environ,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        _shortcut_processes.append(proc)
     except Exception as exc:
         log.error("Erro ao executar atalho: %s", exc)
 
@@ -1854,13 +1826,12 @@ def start_ui(hostname: str):
 
         def shutdown():
             log.info("Encerrando %s...", APP_NAME)
-            # Mata processos de atalhos abertos pelo usuário para
-            # não ficarem órfãos.
-            try:
-                _kill_shortcut_processes()
-            except Exception as exc:
-                log.warning("Erro ao matar processos de atalhos no shutdown: %s", exc)
-            # Para o display virtual ativo (Xvfb, x2x, WM, terminal, etc.)
+            # BUG: antes chamava só os._exit(0) direto — isso mata o
+            # processo Python na hora, sem rodar nenhuma limpeza. Filhos
+            # como Xvfb, x2x, xterm e o WM (openbox/fluxbox/...) ficavam
+            # órfãos rodando pra sempre, mesmo com o server fechado. Para
+            # o display virtual ativo primeiro (isso já mata x2x/Xvfb/
+            # xterm/WM juntos, ver XvfbVirtualDisplay.stop()).
             try:
                 stop_active_display()
             except Exception as exc:
@@ -1869,10 +1840,7 @@ def start_ui(hostname: str):
                 root.destroy()
             except Exception:
                 pass
-            # Usa sys.exit em vez de os._exit para garantir que os
-            # handlers atexit rodem (incluindo stop_active_display como
-            # rede de segurança).
-            sys.exit(0)
+            os._exit(0)
 
         root.protocol("WM_DELETE_WINDOW", shutdown)
 
@@ -2420,7 +2388,6 @@ def start_ui(hostname: str):
 # ==========================================================================
 
 async def on_shutdown(app: web.Application):
-    _kill_shortcut_processes()
     for pc in list(pcs):
         await pc.close()
     pcs.clear()
@@ -2458,15 +2425,10 @@ def main():
     # etc.). atexit cobre saída normal (`sys.exit`/fim do script); os
     # handlers de sinal cobrem SIGTERM/SIGINT — sem eles, `os._exit(0)` ou
     # um sinal não tratado matam o processo sem rodar nenhuma limpeza.
-    atexit.register(_kill_shortcut_processes)
     atexit.register(stop_active_display)
 
     def _handle_signal(signum, _frame):
         log.info("Sinal %s recebido — encerrando %s...", signum, APP_NAME)
-        try:
-            _kill_shortcut_processes()
-        except Exception:
-            pass
         try:
             stop_active_display()
         except Exception:

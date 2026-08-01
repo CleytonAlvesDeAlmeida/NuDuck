@@ -77,14 +77,6 @@ class MdnsDiscovery(private val context: Context) {
                 releaseMulticastLock()
             }
         }
-        executor.shutdown()
-        try {
-            if (!executor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)) {
-                executor.shutdownNow()
-            }
-        } catch (_: InterruptedException) {
-            executor.shutdownNow()
-        }
     }
 
     private fun acquireMulticastLock() {

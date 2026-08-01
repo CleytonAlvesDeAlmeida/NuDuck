@@ -201,13 +201,5 @@ class UsbConnectionMonitor(private val context: Context) {
         pollThread = null
         discoveredHost = null
         scanGeneration.incrementAndGet() // cancela qualquer varredura pendente
-        scanExecutor.shutdown()
-        try {
-            if (!scanExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)) {
-                scanExecutor.shutdownNow()
-            }
-        } catch (_: InterruptedException) {
-            scanExecutor.shutdownNow()
-        }
     }
 }
