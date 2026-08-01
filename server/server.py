@@ -47,6 +47,18 @@ from av import VideoFrame
 from zeroconf import ServiceInfo, Zeroconf
 import cv2
 
+# Correção de performance (consumo de CPU durante a transmissão):
+# por padrão o OpenCV cria sozinho um pool de threads usando TODOS os
+# núcleos da CPU para operações como cv2.resize/fillPoly, mesmo sendo
+# operações pequenas (um frame por vez). Isso disputa CPU com as threads
+# de codificação de vídeo do aiortc (libvpx/openh264) e com o resto do
+# sistema (navegador, player de vídeo, etc.), aumentando o consumo total
+# e a chance de engasgos em outros programas enquanto o app está
+# transmitindo. Como aqui cada operação já é rápida e roda uma de cada
+# vez (single-threaded por natureza no nosso pipeline), forçar 1 thread
+# no OpenCV elimina essa disputa sem deixar a captura mais lenta.
+cv2.setNumThreads(1)
+
 # Display virtual Xvfb (abordagem SpaceDesk para o modo Estender)
 from virtual_display import XvfbVirtualDisplay, is_xvfb_available, stop_active_display, set_active_display, get_active_display
 import json as _json
@@ -444,6 +456,19 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._monitor = None
         self._time_base = fractions.Fraction(1, 90000)
 
+        # Correção do bug de mapeamento de toque: quando a proporção da
+        # tela do celular é diferente da do PC, o _letterbox() abaixo
+        # adiciona barras pretas na imagem transmitida. Sem saber onde
+        # essas barras estão, um toque normalizado (0.0-1.0) vindo do
+        # celular mapeia direto para pixels do PC como se a imagem
+        # ocupasse a tela inteira — errando a posição em qualquer
+        # resolução/proporção que não seja idêntica à do PC. Este
+        # retângulo guarda, em coordenadas normalizadas (0.0-1.0) do
+        # frame ENVIADO, onde o conteúdo real da tela do PC começa e
+        # termina — (x0, y0, largura, altura) — pra compensar isso.
+        # Sem barras (proporções iguais): (0.0, 0.0, 1.0, 1.0).
+        self._content_rect = (0.0, 0.0, 1.0, 1.0)
+
         # Display virtual Xvfb (modo Estender)
         self._virtual_display = None
         self._virtual_display_info = None
@@ -644,36 +669,62 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
     def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
-        resolução do celular, sem cortar nenhuma parte da imagem.
+        PROPORÇÃO (aspect ratio) da tela do celular, sem cortar nenhuma
+        parte da imagem — e SEM ampliar para a resolução física do
+        celular.
 
-        Versão cv2/numpy (opera em BGR) — antes era feita em PIL, exigindo
-        mais uma conversão de canal + cópia completa do frame. Se as
-        dimensões do celular não forem conhecidas, retorna a imagem
-        original sem alteração.
+        Upscaling no lado do cliente (item novo): antigamente esta
+        função devolvia um canvas já do tamanho físico do celular (ex.:
+        1080x2400), então o servidor sempre codificava/enviava nessa
+        resolução cheia, não importa a qualidade escolhida (144p só
+        deixava a imagem borrada, mas do mesmo "tamanho" pro codec).
+        Agora o canvas fica na MESMA escala de pixels do frame que já
+        temos (ancorado na altura, que é justamente o que a qualidade
+        escolhida controla) — só ajustando a largura para bater com a
+        proporção da tela do celular. Isso mantém o vídeo transmitido
+        pequeno de verdade (menos CPU pra codificar, menos dado pra
+        enviar pela rede). Quem faz a ampliação até preencher a tela
+        agora é o app Android, usando a GPU do aparelho (ver
+        SharpUpscaleDrawer.kt no cliente) — daí o nome "upscaling no
+        lado do cliente".
         """
         if not self._phone_w or not self._phone_h:
+            self._content_rect = (0.0, 0.0, 1.0, 1.0)
             return img_bgr
 
-        phone_w, phone_h = self._phone_w, self._phone_h
         img_h, img_w = img_bgr.shape[:2]
+        phone_aspect = self._phone_w / self._phone_h
 
-        # Se a imagem já tem o aspect ratio do celular, só redimensiona
-        if abs(img_w / img_h - phone_w / phone_h) < 0.02:
-            return cv2.resize(img_bgr, (phone_w, phone_h), interpolation=cv2.INTER_LINEAR)
+        # Se a imagem já tem o aspect ratio do celular, não precisa de barras
+        if abs(img_w / img_h - phone_aspect) < 0.02:
+            self._content_rect = (0.0, 0.0, 1.0, 1.0)
+            return img_bgr
 
-        # Calcula escala para caber dentro da tela do celular
-        scale = min(phone_w / img_w, phone_h / img_h)
+        # Canvas com a proporção do celular, mas na escala de pixels do
+        # frame atual (ancorado na altura já escolhida pela qualidade).
+        canvas_h = max(16, round(img_h / 16) * 16)
+        canvas_w = max(16, round((canvas_h * phone_aspect) / 16) * 16)
+
+        scale = min(canvas_w / img_w, canvas_h / img_h)
         new_w = max(1, int(img_w * scale))
         new_h = max(1, int(img_h * scale))
 
-        # Redimensiona mantendo proporção
         resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        # Cria canvas preto nas dimensões do celular e centraliza
-        canvas = np.zeros((phone_h, phone_w, 3), dtype=np.uint8)
-        x_offset = (phone_w - new_w) // 2
-        y_offset = (phone_h - new_h) // 2
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        x_offset = (canvas_w - new_w) // 2
+        y_offset = (canvas_h - new_h) // 2
         canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+        # Guarda onde o conteúdo real ficou dentro do frame enviado, em
+        # coordenadas normalizadas (0.0-1.0) — usado por
+        # handle_control_message() pra corrigir a posição do toque.
+        self._content_rect = (
+            x_offset / canvas_w,
+            y_offset / canvas_h,
+            new_w / canvas_w,
+            new_h / canvas_h,
+        )
 
         return canvas
 
@@ -729,13 +780,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 if not self._is_low_latency:
                     self._draw_cursor_virtual(frame_resized, src_w, src_h)
 
-                # Adaptar à resolução do celular se conhecida
+                # Ajusta só a PROPORÇÃO (aspect ratio) do celular, sem ampliar
+                # pixels — o app Android amplia na GPU (upscaling no cliente).
                 if self._phone_w and self._phone_h:
-                    phone_w, phone_h = self._phone_w, self._phone_h
-                    a_phone_w = max(16, round(phone_w / 16) * 16)
-                    a_phone_h = max(16, round(phone_h / 16) * 16)
                     frame_resized = self._letterbox(frame_resized)
-                    frame_resized = cv2.resize(frame_resized, (a_phone_w, a_phone_h), interpolation=cv2.INTER_LINEAR)
 
                 return VideoFrame.from_ndarray(np.ascontiguousarray(frame_resized), format="bgr24")
 
@@ -800,13 +848,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
         if not self._is_low_latency:
             self._draw_cursor(frame_resized)
 
-        # Adaptar à resolução do celular se conhecida
+        # Ajusta só a PROPORÇÃO (aspect ratio) do celular, sem ampliar
+        # pixels — o app Android amplia na GPU (upscaling no cliente).
         if self._phone_w and self._phone_h:
-            phone_w, phone_h = self._phone_w, self._phone_h
-            a_phone_w = max(16, round(phone_w / 16) * 16)
-            a_phone_h = max(16, round(phone_h / 16) * 16)
             frame_resized = self._letterbox(frame_resized)
-            frame_resized = cv2.resize(frame_resized, (a_phone_w, a_phone_h), interpolation=cv2.INTER_LINEAR)
 
         return VideoFrame.from_ndarray(np.ascontiguousarray(frame_resized), format="bgr24")
 
@@ -961,6 +1006,19 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
     if mtype in ("tap", "move", "down", "up"):
         x = min(max(float(msg.get("x", 0)), 0.0), 1.0)
         y = min(max(float(msg.get("y", 0)), 0.0), 1.0)
+
+        # Corrige o toque para descontar as barras pretas (letterbox)
+        # que o frame enviado pode ter, quando a proporção da tela do
+        # celular é diferente da do PC (ver _content_rect em
+        # ScreenCaptureTrack._letterbox). Sem isso, um toque no meio da
+        # tela do celular podia cair fora do lugar certo no PC.
+        rx0, ry0, rw, rh = screen_track._content_rect
+        if rw > 0 and rh > 0:
+            x = (x - rx0) / rw
+            y = (y - ry0) / rh
+        x = min(max(x, 0.0), 1.0)
+        y = min(max(y, 0.0), 1.0)
+
         px, py = int(x * screen_w), int(y * screen_h)
 
         if mtype == "tap":
@@ -2418,6 +2476,20 @@ def _port_available(port: int) -> bool:
 
 def main():
     hostname = socket.gethostname().split(".")[0]
+
+    # Correção de performance (PC lento / vídeos travando durante a
+    # transmissão): reduz a prioridade de agendamento de CPU do processo
+    # do servidor (equivalente a rodar com `nice`). Isso não reduz o
+    # consumo total de CPU, mas diz ao sistema operacional para dar
+    # preferência a outros programas (navegador, players de vídeo, etc.)
+    # sempre que houver disputa pelos núcleos — é exatamente o cenário de
+    # "YouTube travando enquanto o celular está conectado". Só funciona
+    # em Linux/macOS (Windows não tem os.nice); em qualquer erro,
+    # simplesmente ignora e segue com a prioridade padrão.
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
 
     # Rede de segurança extra pro bug do x2x/Xvfb ficando órfão: cobre os
     # casos que não passam pelo botão "fechar janela" do Tkinter (matar o

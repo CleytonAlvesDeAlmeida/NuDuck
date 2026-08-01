@@ -217,6 +217,34 @@ qualidades baixas). Além disso:
   disponível no Android, mas a RAM livre ainda importa para não sofrer
   lag por troca de app em segundo plano.
 
+### Por que o PC fica mais lento (vídeo travando) enquanto transmite
+
+É esperado que o uso de CPU suba bastante durante a transmissão: o
+servidor precisa **codificar** cada frame da tela em vídeo (VP8/H.264)
+em tempo real, e essa codificação é feita por software (sem usar a
+placa de vídeo), então ela sempre consome uma boa fatia da CPU —
+principalmente em qualidades altas (720p/1080p) ou em notebooks/PCs
+mais fracos. Duas melhorias foram feitas para reduzir esse impacto:
+
+1. **Menos disputa de CPU entre a captura de tela e a codificação de
+   vídeo.** Antes, a biblioteca de captura (OpenCV) tentava usar todos
+   os núcleos da CPU sozinha para redimensionar cada frame, competindo
+   diretamente com as threads que codificam o vídeo — e com o resto do
+   PC (navegador, player de vídeo). Agora ela usa só 1 thread, o que é
+   suficiente para essa tarefa e elimina essa disputa.
+2. **Prioridade mais baixa para o processo do servidor.** O servidor
+   agora roda com prioridade de CPU reduzida (`nice`), o que diz ao
+   Linux para dar preferência a outros programas — como o navegador
+   rodando um vídeo do YouTube — sempre que a CPU estiver disputada.
+   Isso ajuda bastante com o sintoma de "vídeo do YouTube travando"
+   enquanto o celular está conectado.
+
+Essas mudanças reduzem o **efeito colateral** sobre outros programas,
+mas não eliminam o custo de CPU da codificação em si — se o PC
+continuar lento, a recomendação continua sendo **baixar a qualidade de
+vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
+"Automático".
+
 ## Segurança
 
 - Sem PIN correto, nada funciona.
@@ -227,6 +255,55 @@ qualidades baixas). Além disso:
 - Nada sai da rede local — sem nuvem, sem telemetria.
 
 ## Changelog
+
+### Atualização (01/08/2026) — Correção: toque mapeado no lugar errado
+- **Bug corrigido: o cursor do mouse sempre ia para o canto
+  inferior/direito da tela, não importava onde a pessoa tocasse.**
+  Causa raiz: no app Android, o tamanho da tela usado para calcular
+  "onde" a pessoa tocou (em porcentagem, 0% a 100%) vinha de uma
+  informação que às vezes não estava pronta a tempo, e ficava travada
+  num valor mínimo (1 pixel) — fazendo qualquer toque virar "100%,
+  100%" (canto inferior direito) depois de arredondado. Agora esse
+  tamanho vem direto do sistema de layout do app (`onSizeChanged`), que
+  está sempre correto e atualizado antes de qualquer toque ser
+  processado — inclusive depois de girar a tela ou abrir/fechar o menu
+  flutuante.
+- **Correção extra: toques desalinhados quando a proporção da tela do
+  celular é diferente da do PC.** Quando a tela do celular tem uma
+  proporção muito diferente da do PC (ex.: celular bem "comprido"), o
+  vídeo transmitido ganha barras pretas nas bordas para não distorcer a
+  imagem. Antes, o servidor não sabia onde essas barras estavam e
+  calculava a posição do toque como se elas não existissem — agora ele
+  desconta exatamente o tamanho das barras, então 1 toque = 1 clique na
+  posição exata, em qualquer combinação de resolução/proporção entre PC
+  e celular.
+
+### Atualização (01/08/2026) — Upscaling no lado do cliente
+- **O servidor agora transmite em resolução baixa de verdade.** Antes, o
+  frame era ampliado de volta para o tamanho físico da tela do celular
+  *antes* de ser codificado — ou seja, mesmo em qualidade "144p" o
+  codec de vídeo trabalhava com um frame do tamanho da tela inteira do
+  celular (só borrado), gastando CPU e banda de rede à toa. Agora o
+  servidor nunca amplia o frame; ele só ajusta a proporção (aspect
+  ratio) da imagem para bater com a do celular, mantendo a resolução
+  baixa escolhida na qualidade de vídeo.
+- **Novo: `SharpUpscaleDrawer.kt` no app Android.** Como o vídeo agora
+  chega pequeno, é o celular quem amplia — usando a própria GPU do
+  aparelho (isso já era feito automaticamente pelo WebRTC ao desenhar
+  o vídeo numa tela maior). Além de ampliar, esse novo desenhista
+  aplica um filtro de nitidez em tempo real (GPU, sem custo perceptível
+  de CPU/bateria) para deixar a imagem ampliada menos borrada.
+- Resultado esperado: menos uso de CPU no PC (o codec de vídeo processa
+  menos pixels), menos uso de rede/Wi-Fi, e uma imagem no celular ainda
+  nítida graças ao realce de nitidez feito na GPU do aparelho.
+
+### Atualização (01/08/2026)
+- **Correção: PC lento / vídeos travando (ex.: YouTube) durante a
+  transmissão.** O OpenCV não disputa mais CPU com a codificação de
+  vídeo (`cv2.setNumThreads(1)`), e o processo do servidor agora roda
+  com prioridade de CPU reduzida (`os.nice`), dando preferência a
+  outros programas quando a CPU está disputada. Ver seção
+  "Dicas de performance" para detalhes.
 
 ### Atualização (29/07/2026)
 - **Novo: Botão "Modo" no menu flutuante** — permite trocar entre

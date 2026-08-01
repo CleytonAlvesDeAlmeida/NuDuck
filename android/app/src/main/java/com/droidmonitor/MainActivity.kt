@@ -66,6 +66,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import com.droidmonitor.discovery.PcInfo
@@ -76,9 +78,11 @@ import com.droidmonitor.ui.SettingsScreen
 import com.droidmonitor.ui.theme.DroidMonitorTheme
 import com.droidmonitor.webrtc.ControlEvents
 import kotlinx.coroutines.delay
+import org.webrtc.EglBase
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
+import com.droidmonitor.webrtc.SharpUpscaleDrawer
 
 @Composable
 private fun qualityLabels(): Map<String, String> {
@@ -643,19 +647,37 @@ fun RemoteVideoView(
     eglBaseContext: org.webrtc.EglBase.Context?,
     onControlEvent: (org.json.JSONObject) -> Unit,
 ) {
-    var viewWidth by remember { mutableStateOf(1) }
-    var viewHeight by remember { mutableStateOf(1) }
+    // BUG CORRIGIDO: o tamanho da view usado para normalizar o toque
+    // (viewWidth/viewHeight) vinha do "update" do AndroidView, que só
+    // reflete o tamanho real da View do Android depois que ela é
+    // medida/desenhada pelo sistema — e nem sempre roda a tempo. Na
+    // prática, viewWidth/viewHeight ficavam travados no valor inicial
+    // (1, 1), então QUALQUER toque virava (posição / 1), um número bem
+    // maior que 1, que era limitado (coerceIn) para 1.0 — ou seja,
+    // sempre "canto inferior direito", não importa onde a pessoa
+    // tocasse. Agora o tamanho vem de onSizeChanged, que é o próprio
+    // Compose informando o tamanho de LAYOUT da view (sempre correto e
+    // atualizado antes dos toques serem processados, inclusive após
+    // rotação de tela ou o menu flutuante aparecer/sumir).
+    var viewSize by remember { mutableStateOf(IntSize.Zero) }
 
     AndroidView(
         modifier = Modifier
             .fillMaxSize()
+            .onSizeChanged { viewSize = it }
             .pointerInput(Unit) {
                 awaitPointerEventScope {
                     while (true) {
                         val event = awaitPointerEvent()
                         val position = event.changes.firstOrNull()?.position ?: continue
-                        val nx = (position.x / viewWidth).coerceIn(0f, 1f)
-                        val ny = (position.y / viewHeight).coerceIn(0f, 1f)
+                        val w = viewSize.width
+                        val h = viewSize.height
+                        // Sem tamanho de view ainda (primeiro frame antes do
+                        // layout) — ignora o toque em vez de mandar uma
+                        // coordenada errada pro servidor.
+                        if (w <= 0 || h <= 0) continue
+                        val nx = (position.x / w).coerceIn(0f, 1f)
+                        val ny = (position.y / h).coerceIn(0f, 1f)
 
                         when (event.type) {
                             PointerEventType.Press -> onControlEvent(ControlEvents.down(nx, ny))
@@ -668,15 +690,18 @@ fun RemoteVideoView(
             },
         factory = { ctx ->
             SurfaceViewRenderer(ctx).apply {
-                eglBaseContext?.let { init(it, null) }
+                // Upscaling no lado do cliente: o servidor manda a tela do
+                // PC em resolução baixa de propósito (economiza CPU/rede no
+                // PC); aqui a GPU do celular amplia e aplica um realce de
+                // nitidez em tempo real (ver SharpUpscaleDrawer) em vez de
+                // usar o desenhista padrão do WebRTC (que só amplia "cru").
+                eglBaseContext?.let {
+                    init(it, null, EglBase.CONFIG_PLAIN, SharpUpscaleDrawer())
+                }
                 setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                 setEnableHardwareScaler(true)
                 videoTrack.addSink(this)
             }
-        },
-        update = { view ->
-            viewWidth = view.width.takeIf { it > 0 } ?: 1
-            viewHeight = view.height.takeIf { it > 0 } ?: 1
         },
     )
 
