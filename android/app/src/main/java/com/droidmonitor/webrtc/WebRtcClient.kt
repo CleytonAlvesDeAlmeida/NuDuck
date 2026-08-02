@@ -41,6 +41,16 @@ class WebRtcClient(
          *  o PC não conseguir uma segunda tela de verdade. `reason`, quando
          *  não nulo, explica o motivo exato reportado pelo PC. */
         fun onModeResolved(requestedMode: String, resolvedMode: String, reason: String?)
+        /** Item 3: posição do cursor do mouse no PC, normalizada (0.0-1.0),
+         *  mandada pelo servidor a cada frame — o cursor não vem mais
+         *  "desenhado dentro" do vídeo, então o app precisa desenhar por
+         *  conta própria em cima da imagem. */
+        fun onCursorPosition(x: Float, y: Float)
+        /** Item 4: desenho real do cursor (seta, texto "I", mãozinha,
+         *  redimensionar, etc.), mandado só quando muda de forma — bitmap
+         *  já pronto para desenhar, mais o "ponto quente" (hotspot) em
+         *  pixels dentro do próprio bitmap. */
+        fun onCursorShape(bitmap: android.graphics.Bitmap, hotX: Int, hotY: Int)
     }
 
     var listener: Listener? = null
@@ -203,7 +213,36 @@ class WebRtcClient(
                     listener?.onControlChannelReady()
                 }
             }
-            override fun onMessage(buffer: DataChannel.Buffer?) {}
+            override fun onMessage(buffer: DataChannel.Buffer?) {
+                val buf = buffer ?: return
+                try {
+                    val bytes = ByteArray(buf.data.remaining())
+                    buf.data.get(bytes)
+                    val json = JSONObject(String(bytes, Charset.forName("UTF-8")))
+
+                    if (json.optString("type") != "cursor_pos") return
+
+                    val x = json.optDouble("x", -1.0).toFloat()
+                    val y = json.optDouble("y", -1.0).toFloat()
+                    if (x in 0f..1f && y in 0f..1f) {
+                        listener?.onCursorPosition(x, y)
+                    }
+
+                    // Item 4: a maioria das mensagens não traz "shape" (só
+                    // manda quando o cursor muda de forma no PC) — evita
+                    // decodificar um PNG a cada frame à toa.
+                    val shape = json.optJSONObject("shape") ?: return
+                    val pngB64 = shape.optString("png", "")
+                    if (pngB64.isEmpty()) return
+                    val pngBytes = android.util.Base64.decode(pngB64, android.util.Base64.DEFAULT)
+                    val bitmap = android.graphics.BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
+                    if (bitmap != null) {
+                        listener?.onCursorShape(bitmap, shape.optInt("hotX", 0), shape.optInt("hotY", 0))
+                    }
+                } catch (e: Exception) {
+                    RemoteLog.e(TAG, "Falha ao processar mensagem do servidor: ${e.message}")
+                }
+            }
             override fun onBufferedAmountChange(amount: Long) {}
         })
 

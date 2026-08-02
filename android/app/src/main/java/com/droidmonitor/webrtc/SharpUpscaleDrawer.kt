@@ -17,12 +17,21 @@ import java.nio.FloatBuffer
  * desenha o vídeo esticado na tela usando a GPU/OpenGL). Esta classe
  * troca o "desenhista" (GlDrawer) padrão por um que, além de ampliar,
  * também aplica um filtro de nitidez em tempo real (GPU, sem custo
- * perceptível de CPU/bateria) pra compensar o borrão da ampliação —
- * técnica clássica de "unsharp mask" (realce de bordas).
+ * perceptível de CPU/bateria) pra compensar o borrão da ampliação.
+ *
+ * Técnica usada: **AMD CAS (Contrast Adaptive Sharpening)**, do
+ * FidelityFX da AMD (código de referência público/MIT, documentado em
+ * gpuopen.com). A diferença pro "unsharp mask" simples (versão
+ * anterior desta classe) é que o CAS mede o CONTRASTE local ao redor
+ * de cada pixel antes de decidir o quanto realçar — em áreas já
+ * detalhadas/ruidosas ele realça pouco (evita amplificar ruído e criar
+ * "auréolas" nas bordas), e em áreas mais lisas/borradas pela
+ * ampliação ele realça mais. Resultado: uma imagem ampliada mais
+ * nítida com efeitos colaterais visuais menores que o unsharp mask.
  *
  * Não é upscale "por IA" tipo super-resolução (isso pesaria demais pra
- * rodar em tempo real num celular comum); é um realce de nitidez leve
- * sobre a ampliação normal, que reduz a sensação de borrão.
+ * rodar em tempo real num celular comum); é um realce de nitidez
+ * adaptativo ao contraste, sobre a ampliação normal.
  *
  * IMPORTANTE (histórico): a primeira versão desta classe estendia
  * `org.webrtc.GlGenericDrawer`, mas essa classe é interna da
@@ -34,10 +43,10 @@ import java.nio.FloatBuffer
  */
 class SharpUpscaleDrawer : RendererCommon.GlDrawer {
 
-    // Força do realce de nitidez. Valores maiores = mais nítido, mas
-    // com risco de "auréolas" nas bordas se exagerar. 0.20-0.30 é um
-    // meio-termo seguro para compensar a ampliação.
-    private val sharpenAmount = 0.25f
+    // Força do realce de nitidez do CAS (0.0 = sem efeito, 1.0 = máximo).
+    // Valores muito altos podem realçar ruído de compressão do vídeo —
+    // 0.4-0.6 é uma faixa segura e visivelmente nítida.
+    private val sharpness = 0.5f
 
     // Quadrado (2 triângulos via TRIANGLE_STRIP) cobrindo a tela toda.
     private val positionBuffer = floatBufferOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
@@ -159,7 +168,7 @@ class SharpUpscaleDrawer : RendererCommon.GlDrawer {
         val texelH = if (frameHeight > 0) 1f / frameHeight else 0f
         GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "texelW"), texelW)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "texelH"), texelH)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "sharpenAmount"), sharpenAmount)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "sharpness"), sharpness)
 
         bindQuadAndDraw(program)
 
@@ -251,20 +260,60 @@ class SharpUpscaleDrawer : RendererCommon.GlDrawer {
                 "precision mediump float;\n" +
                     "uniform sampler2D tex;\n"
             }
+            // Port do algoritmo de referência "CasFilter" do AMD FidelityFX
+            // CAS (Contrast Adaptive Sharpening) — código original da AMD é
+            // MIT/domínio público, documentado em gpuopen.com/fidelityfx-cas.
+            // Adaptado aqui pra GLSL ES 2.0 (mobile), operando em RGB (o
+            // conteúdo já vem convertido pra RGB antes de chegar neste
+            // shader, seja de uma textura OES ou 2D comum).
             return header + """
                 uniform float texelW;
                 uniform float texelH;
-                uniform float sharpenAmount;
+                uniform float sharpness;
                 varying vec2 vTexCoord;
                 void main() {
-                    vec4 center = texture2D(tex, vTexCoord);
-                    vec4 top    = texture2D(tex, vTexCoord + vec2(0.0, -texelH));
-                    vec4 bottom = texture2D(tex, vTexCoord + vec2(0.0,  texelH));
-                    vec4 left   = texture2D(tex, vTexCoord + vec2(-texelW, 0.0));
-                    vec4 right  = texture2D(tex, vTexCoord + vec2( texelW, 0.0));
-                    vec4 sharpened = center * (1.0 + 4.0 * sharpenAmount)
-                        - (top + bottom + left + right) * sharpenAmount;
-                    gl_FragColor = clamp(sharpened, 0.0, 1.0);
+                    // Vizinhança 3x3 ao redor do pixel central "e":
+                    //   a b c
+                    //   d e f
+                    //   g h i
+                    vec2 t = vec2(texelW, texelH);
+                    vec3 a = texture2D(tex, vTexCoord + vec2(-t.x, -t.y)).rgb;
+                    vec3 b = texture2D(tex, vTexCoord + vec2( 0.0, -t.y)).rgb;
+                    vec3 c = texture2D(tex, vTexCoord + vec2( t.x, -t.y)).rgb;
+                    vec3 d = texture2D(tex, vTexCoord + vec2(-t.x,  0.0)).rgb;
+                    vec3 e = texture2D(tex, vTexCoord).rgb;
+                    vec3 f = texture2D(tex, vTexCoord + vec2( t.x,  0.0)).rgb;
+                    vec3 g = texture2D(tex, vTexCoord + vec2(-t.x,  t.y)).rgb;
+                    vec3 h = texture2D(tex, vTexCoord + vec2( 0.0,  t.y)).rgb;
+                    vec3 i = texture2D(tex, vTexCoord + vec2( t.x,  t.y)).rgb;
+
+                    // Mínimo e máximo "suaves" (cruz + cantos, com peso
+                    // maior pra cruz) — é isso que dá ao CAS a noção de
+                    // CONTRASTE LOCAL, usada abaixo pra decidir o quanto
+                    // realçar cada pixel sem exagerar em áreas ruidosas.
+                    vec3 mnRGB = min(min(min(d, e), min(f, b)), h);
+                    vec3 mnRGB2 = min(mnRGB, min(min(a, c), min(g, i)));
+                    mnRGB += mnRGB2;
+
+                    vec3 mxRGB = max(max(max(d, e), max(f, b)), h);
+                    vec3 mxRGB2 = max(mxRGB, max(max(a, c), max(g, i)));
+                    mxRGB += mxRGB2;
+
+                    // Distância suave até o limite do sinal, dividida pelo
+                    // máximo — quanto mais "achatado" (baixo contraste) o
+                    // entorno, mais essa amplitude empurra o realce pra cima.
+                    vec3 rcpMRGB = 1.0 / max(mxRGB, 0.0001);
+                    vec3 ampRGB = clamp(min(mnRGB, 2.0 - mxRGB) * rcpMRGB, 0.0, 1.0);
+                    ampRGB = inversesqrt(ampRGB + 0.0001);
+
+                    float peak = 8.0 - 3.0 * clamp(sharpness, 0.0, 1.0);
+                    vec3 wRGB = -(1.0 / (ampRGB * peak));
+                    vec3 rcpWeightRGB = 1.0 / (4.0 * wRGB + 1.0);
+
+                    vec3 window = (b + d) + (f + h);
+                    vec3 sharpened = clamp((window * wRGB + e) * rcpWeightRGB, 0.0, 1.0);
+
+                    gl_FragColor = vec4(sharpened, 1.0);
                 }
             """
         }

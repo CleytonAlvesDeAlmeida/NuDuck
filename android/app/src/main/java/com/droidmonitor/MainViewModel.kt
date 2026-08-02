@@ -2,6 +2,7 @@ package com.droidmonitor
 
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Point
 import android.util.DisplayMetrics
 import android.view.WindowManager
@@ -40,6 +41,22 @@ sealed class Screen {
 
 /** Representa um atalho vindo do servidor. */
 data class ShortcutItem(val name: String)
+
+/** Item 3/4: estado do cursor do mouse no PC, mandado pelo servidor pelo
+ *  DataChannel (não vem mais "desenhado dentro" do vídeo). `x`/`y` são
+ *  normalizados (0.0-1.0) em relação à área capturada no PC. `bitmap` é
+ *  nulo até a primeira forma de cursor chegar — nesse meio tempo o app
+ *  desenha uma setinha padrão. `hotXNorm`/`hotYNorm` é o "ponto quente"
+ *  do cursor (ex.: a ponta da seta) já normalizado (0.0-1.0) dentro do
+ *  próprio bitmap, pra poder posicionar certo em qualquer tamanho de tela.
+ */
+data class CursorState(
+    val x: Float = 0.5f,
+    val y: Float = 0.5f,
+    val bitmap: Bitmap? = null,
+    val hotXNorm: Float = 0f,
+    val hotYNorm: Float = 0f,
+)
 
 data class UiState(
     val discoveredPcs: List<PcInfo> = emptyList(),
@@ -84,6 +101,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _remoteVideoTrack = MutableStateFlow<VideoTrack?>(null)
     val remoteVideoTrack: StateFlow<VideoTrack?> = _remoteVideoTrack
+
+    // Item 3/4: posição + forma do cursor do mouse no PC (ver CursorState).
+    private val _cursorState = MutableStateFlow(CursorState())
+    val cursorState: StateFlow<CursorState> = _cursorState
 
     private val mdnsDiscovery = MdnsDiscovery(application)
     private val settingsRepository = SettingsRepository(application)
@@ -409,6 +430,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { it.copy(modeNotice = notice) }
                 }
             }
+
+            override fun onCursorPosition(x: Float, y: Float) {
+                _cursorState.update { it.copy(x = x, y = y) }
+            }
+
+            override fun onCursorShape(bitmap: Bitmap, hotX: Int, hotY: Int) {
+                val hotXNorm = if (bitmap.width > 0) hotX.toFloat() / bitmap.width else 0f
+                val hotYNorm = if (bitmap.height > 0) hotY.toFloat() / bitmap.height else 0f
+                _cursorState.update { it.copy(bitmap = bitmap, hotXNorm = hotXNorm, hotYNorm = hotYNorm) }
+            }
         }
 
         signaling.listener = object : SignalingClient.Listener {
@@ -589,6 +620,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         webRtcClient = null
         signalingClient = null
         _remoteVideoTrack.value = null
+        _cursorState.value = CursorState()
         _uiState.update {
             it.copy(
                 screen = Screen.Discovery,

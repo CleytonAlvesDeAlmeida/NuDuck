@@ -256,6 +256,34 @@ vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
 
 ## Changelog
 
+### Atualização (01/08/2026) — AMD CAS + cursor no celular + economia de CPU parado
+- **Nitidez trocada de "Unsharp Mask" para AMD CAS** (Contrast Adaptive
+  Sharpening, do FidelityFX da AMD — algoritmo público/MIT). Diferença
+  na prática: o CAS mede o contraste local antes de decidir o quanto
+  realçar cada pixel, então realça pouco em áreas já detalhadas/com
+  ruído (evita "auréolas" nas bordas) e mais em áreas lisas/borradas
+  pela ampliação — resultado mais limpo que o unsharp mask simples.
+- **Item 3 — cursor não é mais desenhado dentro do vídeo.** Antes, o PC
+  desenhava uma setinha em cima de CADA frame (rodava o tempo todo,
+  mesmo com o mouse parado). Agora ele só manda a posição do cursor
+  como uma mensagem pequena pelo canal que já existia (DataChannel), e
+  o celular desenha o cursor por conta própria, por cima do vídeo.
+- **Item 4 — ícone do cursor de verdade.** Usando o X11 (extensão
+  XFixes), o servidor detecta o desenho REAL do cursor no PC (seta,
+  texto "I", mãozinha, redimensionar, etc.) e manda pro celular só
+  quando ele muda de forma — não em todo frame. Se o XFixes não
+  estiver disponível no ambiente do PC, o app simplesmente continua
+  mostrando uma setinha genérica, sem quebrar nada.
+- **Item 7 — menos CPU quando a tela do PC não muda.** O servidor
+  agora percebe quando a tela fica parada (ex.: você lendo algo, sem
+  mexer o mouse) e aumenta gradualmente o tempo entre capturas —
+  economizando CPU de captura, redimensionamento e codificação
+  exatamente quando não há nada de novo pra mostrar. Volta ao normal
+  na hora que algo muda de novo na tela.
+- Novo pacote Python necessário no PC: `python-xlib` (adicionado ao
+  `requirements.txt` — se você instala as dependências manualmente,
+  rode `pip install -r requirements.txt` de novo).
+
 ### Atualização (01/08/2026) — Correção: erro de build no Codemagic
 - **Bug corrigido: `SharpUpscaleDrawer.kt` não compilava** (erro
   `Cannot access 'GlGenericDrawer': it is package-private in

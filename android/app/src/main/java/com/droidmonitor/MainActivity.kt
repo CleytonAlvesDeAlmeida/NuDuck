@@ -64,10 +64,17 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
+import kotlin.math.roundToInt
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import com.droidmonitor.discovery.PcInfo
@@ -585,6 +592,10 @@ fun ConnectedScreen(
                 eglBaseContext = viewModel.activeWebRtcClient?.eglBase?.eglBaseContext,
                 onControlEvent = { json -> viewModel.sendControlEvent(json) },
             )
+            // Item 3/4: cursor do mouse do PC, desenhado aqui pelo app (não
+            // vem mais embutido no vídeo) — ver CursorOverlay abaixo.
+            val cursorState by viewModel.cursorState.collectAsState()
+            CursorOverlay(cursorState = cursorState)
         } else {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(color = Color.White)
@@ -712,3 +723,76 @@ fun RemoteVideoView(
         }
     }
 }
+
+/**
+ * Item 3/4: desenha o cursor do mouse do PC por cima do vídeo.
+ *
+ * Antes, o servidor desenhava uma setinha DENTRO de cada frame de vídeo
+ * — agora ele só manda a posição (e, quando muda, o desenho real do
+ * cursor) como mensagens pequenas pelo DataChannel, e é o celular quem
+ * desenha. Isso tira do PC um trabalho que rodava em todo frame, mesmo
+ * parado.
+ *
+ * Enquanto nenhum desenho de cursor real chegou ainda (`bitmap == null`
+ * — normal logo após conectar), desenha uma setinha simples genérica no
+ * lugar, só pra não ficar sem nada.
+ */
+@Composable
+fun CursorOverlay(cursorState: CursorState, modifier: Modifier = Modifier) {
+    var boxSize by remember { mutableStateOf(IntSize.Zero) }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .onSizeChanged { boxSize = it },
+    ) {
+        if (boxSize.width <= 0 || boxSize.height <= 0) return@Box
+
+        val cursorSizeDp: Dp = 24.dp
+        val density = LocalDensity.current
+        val cursorSizePx = with(density) { cursorSizeDp.toPx() }
+
+        val xPx = cursorState.x * boxSize.width
+        val yPx = cursorState.y * boxSize.height
+
+        val bitmap = cursorState.bitmap
+        if (bitmap != null) {
+            // Desloca pelo "ponto quente" real do cursor (ex.: a ponta da
+            // seta, não o canto do bitmap) — assim a posição fica exata.
+            val offsetX = (xPx - cursorState.hotXNorm * cursorSizePx).roundToInt()
+            val offsetY = (yPx - cursorState.hotYNorm * cursorSizePx).roundToInt()
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier
+                    .offset { IntOffset(offsetX, offsetY) }
+                    .size(cursorSizeDp),
+            )
+        } else {
+            // Setinha genérica de fallback (mesmo desenho que o servidor
+            // usava antes de embutir no vídeo), só até a primeira forma
+            // real chegar do PC.
+            Canvas(
+                modifier = Modifier
+                    .offset { IntOffset(xPx.roundToInt(), yPx.roundToInt()) }
+                    .size(cursorSizeDp),
+            ) {
+                val w = size.width
+                val h = size.height
+                val path = Path().apply {
+                    moveTo(0f, 0f)
+                    lineTo(0f, h * 0.78f)
+                    lineTo(w * 0.35f, h * 0.58f)
+                    lineTo(w * 0.55f, h * 1.0f)
+                    lineTo(w * 0.70f, h * 0.90f)
+                    lineTo(w * 0.50f, h * 0.52f)
+                    lineTo(w * 0.85f, h * 0.45f)
+                    close()
+                }
+                drawPath(path, color = Color.White)
+                drawPath(path, color = Color.Black, style = Stroke(width = 1.5f))
+            }
+        }
+    }
+}
+

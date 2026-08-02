@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -429,6 +430,45 @@ def _crop_window_from_frame(frame_bgr, monitor, geo):
     return frame_bgr[rel_y:rel_y + h, rel_x:rel_x + w]
 
 
+def _cursor_image_to_png_b64(cursor, max_size: int = 48) -> str:
+    """Item 4: converte o array de pixels ARGB devolvido pelo XFixes
+    (`display.xfixes_get_cursor_image`) num PNG pequeno em base64, pronto
+    pra mandar pro celular pelo DataChannel. Só é chamada quando o
+    cursor muda de forma (ver ScreenCaptureTrack._get_cursor_shape_update),
+    então o custo de gerar o PNG é raro, não por frame.
+    """
+    import base64
+    import io
+    from PIL import Image
+
+    w, h = cursor.width, cursor.height
+    pixels = list(cursor.cursor_image)
+    if w <= 0 or h <= 0 or w * h != len(pixels):
+        raise ValueError("dimensões do cursor inconsistentes")
+
+    # Cada pixel vem como um inteiro ARGB (0xAARRGGBB) — desmonta em
+    # canais via deslocamento de bits, o que funciona independente da
+    # ordem de bytes da máquina (os valores já chegam como int do Python).
+    arr = np.array(pixels, dtype=np.uint32).reshape(h, w)
+    rgba = np.empty((h, w, 4), dtype=np.uint8)
+    rgba[:, :, 0] = (arr >> 16) & 0xFF  # R
+    rgba[:, :, 1] = (arr >> 8) & 0xFF   # G
+    rgba[:, :, 2] = arr & 0xFF          # B
+    rgba[:, :, 3] = (arr >> 24) & 0xFF  # A
+
+    img = Image.fromarray(rgba, mode="RGBA")
+
+    # Cursores do X11 já costumam ser pequenos (24-32px), mas por
+    # segurança limita o tamanho máximo enviado pela rede.
+    if max(w, h) > max_size:
+        scale = max_size / max(w, h)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 # ==========================================================================
 # Captura de tela -> VideoStreamTrack
 # ==========================================================================
@@ -468,6 +508,26 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # termina — (x0, y0, largura, altura) — pra compensar isso.
         # Sem barras (proporções iguais): (0.0, 0.0, 1.0, 1.0).
         self._content_rect = (0.0, 0.0, 1.0, 1.0)
+
+        # Item 3/4: cursor não é mais desenhado dentro do frame de vídeo
+        # (isso rodava em TODO frame, mesmo com o mouse parado). Agora a
+        # posição — e, quando possível, o desenho real do cursor — é
+        # mandada como uma mensagem pequena pelo DataChannel, e o
+        # celular desenha o cursor por conta própria, por cima do vídeo.
+        self._control_channel = None
+        self._last_cursor_serial = None
+        self._xfixes_display = None
+        self._xfixes_unavailable = False
+
+        # Item 7: se a tela não muda por vários frames seguidos (ex.:
+        # usuário parado lendo algo), aumenta gradualmente o intervalo
+        # entre capturas — economiza CPU de captura/redimensionamento/
+        # codificação exatamente quando não há nada de novo pra mostrar.
+        # Volta ao normal assim que qualquer mudança real aparecer.
+        self._last_frame_fp = None
+        self._idle_streak = 0
+        self._IDLE_THRESHOLD_FRAMES = 30   # ~1-1.5s parado antes de começar a reduzir
+        self._IDLE_MAX_MULTIPLIER = 6      # no máximo ~6x mais devagar (ex.: 24fps -> 4fps)
 
         # Display virtual Xvfb (modo Estender)
         self._virtual_display = None
@@ -594,78 +654,119 @@ class ScreenCaptureTrack(VideoStreamTrack):
             self._load_ema = None
             log.info("Automático: subiu para %s", QUALITY_ORDER[self._auto_idx])
 
-    def _draw_cursor(self, img_bgr):
-        """Desenha um cursor de seta na posição do mouse, direto no array
-        BGR (numpy) via cv2 — ver nota de performance em _draw_cursor_arrow."""
-        try:
-            cx, cy = pyautogui.position()
-        except Exception:
+    def _send_cursor_update(self):
+        """Item 3/4: manda a posição — e, quando possível, o desenho real
+        — do cursor pro celular como uma mensagem pequena no DataChannel,
+        em vez de desenhar o cursor dentro de cada frame de vídeo (isso
+        rodava em TODO frame, mesmo com o mouse parado). O celular
+        desenha o cursor por conta própria, por cima do vídeo.
+        """
+        channel = self._control_channel
+        if channel is None or getattr(channel, "readyState", None) != "open":
             return
 
-        src_w = self._monitor["width"]
-        src_h = self._monitor["height"]
-        rel_x = cx - self._monitor["left"]
-        rel_y = cy - self._monitor["top"]
-        if not (0 <= rel_x < src_w and 0 <= rel_y < src_h):
-            return  # cursor em outro monitor
-
-        self._draw_cursor_arrow(img_bgr, rel_x, rel_y, src_w, src_h)
-
-    def _draw_cursor_arrow(self, img_bgr, cursor_x, cursor_y, src_w, src_h):
-        """Desenha uma seta de cursor em (cursor_x, cursor_y) do frame original.
-
-        Trabalha direto no array BGR (numpy) via cv2.fillPoly/polylines, em
-        vez de converter pra PIL só pra desenhar a seta. Antes, TODO frame
-        (não só quando ia desenhar cursor) passava por
-        BGR→RGB→PIL→numpy→BGR — duas conversões de canal (cvtColor) e duas
-        cópias completas do buffer, a cada frame, no fps alvo inteiro. Isso
-        é custo de CPU/RAM real e evitável: agora o pipeline inteiro fica
-        em BGR/numpy do início ao fim, e só usamos cv2 (que já opera sobre
-        o buffer existente, sem alocar uma cópia num formato diferente).
-
-        Parâmetros:
-            img_bgr:    array numpy BGR (já redimensionado para o target),
-                        modificado in-place.
-            cursor_x:   posição X do cursor no display original (pixels)
-            cursor_y:   posição Y do cursor no display original (pixels)
-            src_w:      largura do display original (pixels)
-            src_h:      altura do display original (pixels)
-        """
-        if not (0 <= cursor_x < src_w and 0 <= cursor_y < src_h):
-            return  # cursor fora da área
-
-        img_h = img_bgr.shape[0]
-        scale = img_h / src_h
-        x = cursor_x * scale
-        y = cursor_y * scale
-
-        s = max(10, int(img_h * 0.035))
-        points = np.array([
-            (x, y), (x, y + s),
-            (x + s * 0.35, y + s * 0.75), (x + s * 0.55, y + s * 1.0),
-            (x + s * 0.72, y + s * 0.88), (x + s * 0.5, y + s * 0.6),
-            (x + s * 0.85, y + s * 0.52),
-        ], dtype=np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(img_bgr, [points], (255, 255, 255))
-        cv2.polylines(img_bgr, [points], isClosed=True, color=(0, 0, 0),
-                       thickness=1, lineType=cv2.LINE_AA)
-
-    def _draw_cursor_virtual(self, img_bgr, src_w, src_h):
-        """Desenha o cursor no display virtual Xvfb.
-
-        Usa xdotool getmouselocation no DISPLAY do Xvfb para pegar a
-        posição do mouse e desenha a seta sobre o frame (direto em BGR).
-        """
-        if not self._virtual_display or not self._virtual_display.is_running():
-            return
-        try:
-            pos = self._virtual_display.get_mouse_position()
+        # Posição do cursor, relativa à área capturada (monitor normal
+        # ou display virtual do modo Estender).
+        if self._virtual_display and self._virtual_display.is_running():
+            try:
+                pos = self._virtual_display.get_mouse_position()
+            except Exception:
+                pos = None
             if pos is None:
                 return
             cx, cy = pos
-            self._draw_cursor_arrow(img_bgr, cx, cy, src_w, src_h)
+            src_w, src_h = self._virtual_display.width, self._virtual_display.height
+        else:
+            try:
+                mx, my = pyautogui.position()
+            except Exception:
+                return
+            mon = self._monitor
+            if not mon:
+                return
+            src_w, src_h = mon["width"], mon["height"]
+            cx, cy = mx - mon["left"], my - mon["top"]
+
+        if src_w <= 0 or src_h <= 0 or not (0 <= cx < src_w and 0 <= cy < src_h):
+            return  # cursor fora da área capturada (outro monitor, etc.)
+
+        payload = {
+            "type": "cursor_pos",
+            "x": round(cx / src_w, 4),
+            "y": round(cy / src_h, 4),
+        }
+
+        shape = self._get_cursor_shape_update()
+        if shape is not None:
+            payload["shape"] = shape
+
+        try:
+            channel.send(json.dumps(payload))
         except Exception:
-            pass
+            pass  # canal pode ter fechado entre a checagem e o envio
+
+    def _init_xfixes(self):
+        """Abre (uma vez) uma conexão X11 dedicada só pra consultar o
+        formato do cursor via XFixes. Se a extensão não existir (ex.:
+        ambiente sem X11 completo) ou algo falhar, desiste
+        silenciosamente — o app continua funcionando normalmente, só sem
+        o desenho customizado do cursor (item 4); a posição (item 3)
+        continua funcionando de qualquer forma.
+        """
+        if self._xfixes_unavailable or self._xfixes_display is not None:
+            return
+        try:
+            from Xlib import display as _xlib_display
+            import Xlib.ext.xfixes  # noqa: F401 — garante que a extensão registra os métodos
+            d = _xlib_display.Display()
+            if not d.has_extension("XFIXES"):
+                self._xfixes_unavailable = True
+                return
+            d.xfixes_query_version()
+            self._xfixes_display = d
+        except Exception as exc:
+            log.debug("XFixes indisponível para detectar o formato do cursor: %s", exc)
+            self._xfixes_unavailable = True
+            self._xfixes_display = None
+
+    def _get_cursor_shape_update(self):
+        """Item 4: detecta o DESENHO real do cursor do X11 (seta, texto
+        'I', mãozinha, redimensionar, etc.) via XFixes, e devolve os
+        dados pra mandar pro celular SÓ quando o cursor muda de forma
+        (a grande maioria dos frames não manda nada aqui — é barato).
+        Devolve None se não há nada novo pra mandar, ou se a extensão
+        XFixes não está disponível.
+        """
+        self._init_xfixes()
+        if self._xfixes_display is None:
+            return None
+
+        try:
+            root = self._xfixes_display.screen().root
+            cursor = self._xfixes_display.xfixes_get_cursor_image(root)
+        except Exception as exc:
+            log.debug("Falha ao consultar o cursor via XFixes: %s", exc)
+            self._xfixes_unavailable = True
+            self._xfixes_display = None
+            return None
+
+        if cursor is None or cursor.cursor_serial == self._last_cursor_serial:
+            return None
+        self._last_cursor_serial = cursor.cursor_serial
+
+        try:
+            png_b64 = _cursor_image_to_png_b64(cursor)
+        except Exception as exc:
+            log.debug("Falha ao converter o cursor para PNG: %s", exc)
+            return None
+
+        return {
+            "w": cursor.width,
+            "h": cursor.height,
+            "hotX": cursor.xhot,
+            "hotY": cursor.yhot,
+            "png": png_b64,
+        }
 
     def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
@@ -775,17 +876,17 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 )
                 frame_resized = cv2.resize(frame_bgr, (target_w, target_h), interpolation=interp)
 
-                # Desenha cursor do mouse no display virtual (Xvfb não renderiza cursor).
-                # Item 9: em low_latency, pula o cursor (corta 5-10ms por frame).
-                if not self._is_low_latency:
-                    self._draw_cursor_virtual(frame_resized, src_w, src_h)
+                # Item 3: cursor não é mais desenhado aqui — ver
+                # _send_cursor_update() em recv(), chamada pelo DataChannel.
 
                 # Ajusta só a PROPORÇÃO (aspect ratio) do celular, sem ampliar
                 # pixels — o app Android amplia na GPU (upscaling no cliente).
                 if self._phone_w and self._phone_h:
                     frame_resized = self._letterbox(frame_resized)
 
-                return VideoFrame.from_ndarray(np.ascontiguousarray(frame_resized), format="bgr24")
+                frame_resized = np.ascontiguousarray(frame_resized)
+                changed = self._update_frame_fingerprint(frame_resized)
+                return VideoFrame.from_ndarray(frame_resized, format="bgr24"), changed
 
             # get_frame() retornou None (não deveria acontecer mais)
             log.warning("get_frame() retornou None, gerando frame de fallback")
@@ -793,7 +894,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 (self._target_h, max(2, int(self._target_h * 16 / 9)), 3),
                 [46, 26, 26], dtype=np.uint8,
             )
-            return VideoFrame.from_ndarray(fallback, format="bgr24")
+            return VideoFrame.from_ndarray(fallback, format="bgr24"), True
 
         # --- Caminho 2: Captura normal com mss (modo Espelhar) ---
         # Se STATE.window_mode=True e janela selecionada, recorta só a janela
@@ -844,38 +945,72 @@ class ScreenCaptureTrack(VideoStreamTrack):
         )
         frame_resized = cv2.resize(img, (target_w, target_h), interpolation=interp)
 
-        # Item 9: em low_latency, pula desenho do cursor.
-        if not self._is_low_latency:
-            self._draw_cursor(frame_resized)
+        # Item 3: cursor não é mais desenhado aqui — ver
+        # _send_cursor_update() em recv(), chamada pelo DataChannel.
 
         # Ajusta só a PROPORÇÃO (aspect ratio) do celular, sem ampliar
         # pixels — o app Android amplia na GPU (upscaling no cliente).
         if self._phone_w and self._phone_h:
             frame_resized = self._letterbox(frame_resized)
 
-        return VideoFrame.from_ndarray(np.ascontiguousarray(frame_resized), format="bgr24")
+        frame_resized = np.ascontiguousarray(frame_resized)
+        changed = self._update_frame_fingerprint(frame_resized)
+        return VideoFrame.from_ndarray(frame_resized, format="bgr24"), changed
+
+    def _update_frame_fingerprint(self, frame_bgr) -> bool:
+        """Item 7: amostra grosseira e rápida do frame (a cada 16 pixels,
+        em vez de comparar o frame inteiro pixel a pixel) pra saber se a
+        tela mudou desde o frame anterior. Retorna True se mudou (ou se é
+        o primeiro frame)."""
+        sample = frame_bgr[::16, ::16].tobytes()
+        fp = zlib.crc32(sample)
+        changed = fp != self._last_frame_fp
+        self._last_frame_fp = fp
+        return changed
 
     async def recv(self):
         if self._start_time is None:
             self._start_time = time.time()
+            self._next_capture_time = self._start_time
 
-        next_frame_time = self._start_time + self._frame_count * self._frame_interval
         now = time.time()
-        if next_frame_time > now:
-            await asyncio.sleep(next_frame_time - now)
+        if self._next_capture_time > now:
+            await asyncio.sleep(self._next_capture_time - now)
+            now = time.time()
 
         loop = asyncio.get_event_loop()
         t0 = time.time()
-        frame = await loop.run_in_executor(self._executor, self._capture_and_convert)
+        frame, changed = await loop.run_in_executor(self._executor, self._capture_and_convert)
         proc_time = time.time() - t0
 
         if self._auto:
             self._adapt_quality(proc_time)
 
-        pts = int(self._frame_count * (90000 / self._fps))
-        frame.pts = pts
+        # Item 7: se a tela ficar parada por vários frames seguidos,
+        # aumenta gradualmente o intervalo até a próxima captura (no
+        # máximo _IDLE_MAX_MULTIPLIER vezes mais devagar). Volta ao
+        # normal imediatamente assim que algo mudar de novo.
+        self._idle_streak = 0 if changed else self._idle_streak + 1
+        if self._idle_streak >= self._IDLE_THRESHOLD_FRAMES:
+            steps_past = (self._idle_streak - self._IDLE_THRESHOLD_FRAMES) // 10
+            idle_multiplier = min(self._IDLE_MAX_MULTIPLIER, 1 + steps_past)
+        else:
+            idle_multiplier = 1
+        self._next_capture_time = now + self._frame_interval * idle_multiplier
+
+        # pts baseado no tempo real decorrido (não em "frame_count * fps
+        # nominal") — assim continua correto mesmo quando o intervalo
+        # entre capturas varia (throttling de tela parada, mudança de
+        # qualidade no modo automático, pequenas variações de agendamento).
+        frame.pts = int((time.time() - self._start_time) * 90000)
         frame.time_base = self._time_base
         self._frame_count += 1
+
+        # Item 3/4: manda a posição (e, quando muda, o desenho) do
+        # cursor pro celular — está no thread do asyncio loop aqui
+        # (não no executor), então é seguro usar o DataChannel.
+        self._send_cursor_update()
+
         return frame
 
     def close(self):
@@ -885,6 +1020,12 @@ class ScreenCaptureTrack(VideoStreamTrack):
             self._virtual_display = None
             self._virtual_display_info = None
             set_active_display(None)
+        if self._xfixes_display is not None:
+            try:
+                self._xfixes_display.close()
+            except Exception:
+                pass
+            self._xfixes_display = None
         self._executor.shutdown(wait=False)
 
 
@@ -1186,6 +1327,10 @@ async def websocket_handler(request: web.Request):
                 @pc.on("datachannel")
                 def on_datachannel(channel):
                     log.info("DataChannel aberto: %s", channel.label)
+                    # Item 3/4: guarda o canal pra também poder mandar
+                    # atualizações de cursor (PC -> celular), não só
+                    # receber toques (celular -> PC).
+                    screen_track._control_channel = channel
 
                     @channel.on("message")
                     def on_message(msg):
