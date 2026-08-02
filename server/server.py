@@ -25,6 +25,19 @@ import ipaddress
 import json
 import logging
 import os
+
+# Pedido: limitar o servidor a 1 núcleo/1 thread de CPU (ver também
+# os.sched_setaffinity em main(), mais abaixo). numpy/OpenCV usam, por
+# baixo dos panos, uma biblioteca de álgebra linear (BLAS/OpenMP) que
+# decide sozinha quantas threads usar — e ela só lê essas variáveis de
+# ambiente na hora que é carregada pela primeira vez. Por isso isso
+# precisa ficar bem no topo do arquivo, ANTES do `import numpy`, ou não
+# faz efeito nenhum.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import queue
 import secrets
 import shutil
@@ -518,6 +531,13 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._last_cursor_serial = None
         self._xfixes_display = None
         self._xfixes_unavailable = False
+        # Bug corrigido: no modo "Espelhar Janela" (só uma janela, não a
+        # tela toda), a posição do cursor tem que ser relativa à JANELA
+        # recortada, não ao monitor inteiro — senão o cursor aparece no
+        # lugar errado. Este retângulo guarda a área REALMENTE mostrada
+        # no frame enviado (monitor inteiro, ou a janela recortada),
+        # atualizado a cada captura em _capture_and_convert().
+        self._effective_source_rect = None
 
         # Item 7: se a tela não muda por vários frames seguidos (ex.:
         # usuário parado lendo algo), aumenta gradualmente o intervalo
@@ -665,8 +685,11 @@ class ScreenCaptureTrack(VideoStreamTrack):
         if channel is None or getattr(channel, "readyState", None) != "open":
             return
 
-        # Posição do cursor, relativa à área capturada (monitor normal
-        # ou display virtual do modo Estender).
+        # Posição do cursor, relativa à área REALMENTE capturada — que
+        # pode ser o monitor inteiro, só uma janela recortada (modo
+        # Espelhar Janela), ou o display virtual (modo Estender).
+        # Bug corrigido: antes usava sempre o monitor inteiro, então no
+        # modo "janela" o cursor aparecia na posição errada.
         if self._virtual_display and self._virtual_display.is_running():
             try:
                 pos = self._virtual_display.get_mouse_position()
@@ -681,19 +704,32 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 mx, my = pyautogui.position()
             except Exception:
                 return
-            mon = self._monitor
-            if not mon:
+            rect = self._effective_source_rect or self._monitor
+            if not rect:
                 return
-            src_w, src_h = mon["width"], mon["height"]
-            cx, cy = mx - mon["left"], my - mon["top"]
+            src_w, src_h = rect["width"], rect["height"]
+            cx, cy = mx - rect["left"], my - rect["top"]
 
         if src_w <= 0 or src_h <= 0 or not (0 <= cx < src_w and 0 <= cy < src_h):
             return  # cursor fora da área capturada (outro monitor, etc.)
 
+        nx = cx / src_w
+        ny = cy / src_h
+
+        # Bug corrigido: o frame enviado pode ter barras pretas
+        # (letterbox) quando a proporção do celular é diferente da do
+        # PC (ver _content_rect em _letterbox). O celular desenha o
+        # cursor relativo ao FRAME INTEIRO (com as barras), então a
+        # posição precisa ser convertida daqui — do espaço "tela do PC"
+        # pro espaço "frame enviado" — ou o cursor aparece deslocado.
+        rx0, ry0, rw, rh = self._content_rect
+        nx = rx0 + nx * rw
+        ny = ry0 + ny * rh
+
         payload = {
             "type": "cursor_pos",
-            "x": round(cx / src_w, 4),
-            "y": round(cy / src_h, 4),
+            "x": round(min(max(nx, 0.0), 1.0), 4),
+            "y": round(min(max(ny, 0.0), 1.0), 4),
         }
 
         shape = self._get_cursor_shape_update()
@@ -998,6 +1034,15 @@ class ScreenCaptureTrack(VideoStreamTrack):
             idle_multiplier = 1
         self._next_capture_time = now + self._frame_interval * idle_multiplier
 
+        # Correção de CPU alta no modo Estender: mantém a thread de
+        # captura do Xvfb (virtual_display.py) na MESMA velocidade que
+        # o vídeo está realmente sendo gerado — incluindo quando a tela
+        # está parada (idle_multiplier acima). Sem isso, aquela thread
+        # sempre capturava a ~30fps por trás, gastando CPU à toa mesmo
+        # quando a qualidade escolhida ou a tela parada pediam bem menos.
+        if self._virtual_display:
+            self._virtual_display.set_capture_interval(self._frame_interval * idle_multiplier)
+
         # pts baseado no tempo real decorrido (não em "frame_count * fps
         # nominal") — assim continua correto mesmo quando o intervalo
         # entre capturas varia (throttling de tela parada, mudança de
@@ -1128,17 +1173,25 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
     # Se o display virtual Xvfb está ativo, envia input pra ele
     if screen_track._virtual_display and screen_track._virtual_display.is_running():
         vd = screen_track._virtual_display
+        # Correção de performance: enviar o toque rodava o xdotool (um
+        # processo externo) de forma BLOQUEANTE, direto no loop
+        # principal do asyncio — o mesmo loop que captura/codifica o
+        # vídeo. Num arrastar de dedo (vários eventos "move" seguidos
+        # rapidinho), isso significava vários pequenos travamentos do
+        # loop inteiro, um atrás do outro. Agora roda em segundo plano
+        # (executor), sem bloquear a captura/codificação de vídeo.
+        loop = asyncio.get_event_loop()
         if mtype in ("tap", "move", "down", "up"):
             x = min(max(float(msg.get("x", 0)), 0.0), 1.0)
             y = min(max(float(msg.get("y", 0)), 0.0), 1.0)
             vx, vy = int(x * vd.width), int(y * vd.height)
             action_map = {"tap": "click", "move": "mousemove", "down": "mousedown", "up": "mouseup"}
-            vd.send_input(action=action_map.get(mtype, "mousemove"), x=vx, y=vy)
+            loop.run_in_executor(None, vd.send_input, action_map.get(mtype, "mousemove"), vx, vy)
             return
         elif mtype == "key":
             key = msg.get("key")
             if key:
-                vd.send_input(action="key", key=key)
+                loop.run_in_executor(None, vd.send_input, "key", 0, 0, key)
             return
 
     # Input normal (pyautogui na tela principal do PC)
@@ -1409,10 +1462,24 @@ async def websocket_handler(request: web.Request):
                         phone_w=phone_w,
                         phone_h=phone_h,
                     )
+                    # Sem isso, o cursor (item 3/4) parava de funcionar
+                    # depois de trocar de modo: é o mesmo DataChannel de
+                    # sempre (continua aberto), só o track antigo é que
+                    # "sabia" sobre ele.
+                    new_track._control_channel = old_track._control_channel
                     STATE.active_screen_track = new_track
                     STATE.current_mode = new_track.resolved_mode
                     # Para o track antigo (fecha Xvfb se estava em extend)
                     old_track.close()
+                    # Bug corrigido: sem esta linha, a variável local
+                    # "screen_track" continuava apontando pro track ANTIGO
+                    # (já fechado) pelo resto desta conexão — então uma
+                    # segunda troca de modo (ex.: Estender -> Espelhar)
+                    # comparava com o modo velho e achava que já estava
+                    # no modo pedido, não fazendo nada. Era exatamente por
+                    # isso que, depois de entrar no Estender, não dava
+                    # pra voltar pro Espelhar.
+                    screen_track = new_track
                     # Substitui no relay e na PeerConnection
                     if pc is not None:
                         sender = pc.getSenders()[0] if pc.getSenders() else None
@@ -2635,6 +2702,27 @@ def main():
         os.nice(10)
     except (AttributeError, OSError):
         pass
+
+    # Pedido: limitar o servidor a 1 núcleo de CPU. Isso PRENDE o
+    # processo (e todas as threads dele) num único núcleo — não importa
+    # quantas threads internas alguma biblioteca decida abrir, todas vão
+    # disputar esse mesmo núcleo só, deixando os outros núcleos livres
+    # pro resto do PC (navegador, etc.) o tempo todo, não só quando há
+    # disputa (diferente do os.nice acima, que só ajuda em caso de
+    # disputa). Só existe no Linux; em outros sistemas (ou se o Python
+    # não tiver esse recurso disponível), simplesmente ignora.
+    #
+    # Importante ficar ciente da troca feita aqui: com só 1 núcleo pra
+    # capturar E codificar o vídeo, qualidades mais altas (720p/1080p)
+    # tendem a ficar mais lentas/travadas do que ficavam antes. Se notar
+    # isso, o mais indicado é usar uma qualidade mais baixa (480p ou
+    # menos) ou automática nas configurações do app. Pra reverter esse
+    # limite, é só remover (ou comentar) este bloco.
+    try:
+        os.sched_setaffinity(0, {0})
+        log.info("Processo limitado ao núcleo de CPU 0 (pedido do usuário).")
+    except (AttributeError, OSError) as exc:
+        log.debug("Não foi possível limitar a 1 núcleo (%s) — seguindo sem essa restrição.", exc)
 
     # Rede de segurança extra pro bug do x2x/Xvfb ficando órfão: cobre os
     # casos que não passam pelo botão "fechar janela" do Tkinter (matar o

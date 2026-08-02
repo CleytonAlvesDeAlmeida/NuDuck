@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -66,6 +65,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -588,15 +588,22 @@ fun ConnectedScreen(
     ) {
         val track = remoteTrack
         if (track != null) {
+            // Bug corrigido: RemoteVideoView e CursorOverlay agora usam a
+            // MESMA área real do vídeo (ver videoContentRect) — antes,
+            // cada um assumia que o vídeo ocupava a view inteira, o que
+            // ficava errado sempre que o WebRTC desenhava barras pretas
+            // próprias por conta de um pequeno descompasso de proporção.
+            var videoFrameSize by remember { mutableStateOf(IntSize.Zero) }
             RemoteVideoView(
                 videoTrack = track,
                 eglBaseContext = viewModel.activeWebRtcClient?.eglBase?.eglBaseContext,
                 onControlEvent = { json -> viewModel.sendControlEvent(json) },
+                onFrameResolutionChanged = { videoFrameSize = it },
             )
             // Item 3/4: cursor do mouse do PC, desenhado aqui pelo app (não
             // vem mais embutido no vídeo) — ver CursorOverlay abaixo.
             val cursorState by viewModel.cursorState.collectAsState()
-            CursorOverlay(cursorState = cursorState)
+            CursorOverlay(cursorState = cursorState, videoFrameSize = videoFrameSize)
         } else {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(color = Color.White)
@@ -658,6 +665,7 @@ fun RemoteVideoView(
     videoTrack: VideoTrack,
     eglBaseContext: org.webrtc.EglBase.Context?,
     onControlEvent: (org.json.JSONObject) -> Unit,
+    onFrameResolutionChanged: (IntSize) -> Unit = {},
 ) {
     // BUG CORRIGIDO: o tamanho da view usado para normalizar o toque
     // (viewWidth/viewHeight) vinha do "update" do AndroidView, que só
@@ -673,6 +681,20 @@ fun RemoteVideoView(
     // rotação de tela ou o menu flutuante aparecer/sumir).
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
 
+    // Bug corrigido (cursor/toque na posição errada no modo Espelhar):
+    // o SurfaceViewRenderer usa SCALE_ASPECT_FIT, que desenha o vídeo
+    // AMPLIADO MAS RESPEITANDO A PROPORÇÃO — se a proporção do vídeo
+    // recebido não bater 100% com a da view (isso pode acontecer por
+    // um arredondamento pequeno, já que o servidor ajusta o vídeo em
+    // múltiplos de 16 pixels), o próprio WebRTC desenha barras pretas
+    // ADICIONAIS por conta própria, sem avisar o resto do app. Antes, o
+    // toque (e o cursor, em CursorOverlay) assumia que o vídeo ocupava
+    // a view inteira — então ficava sistematicamente deslocado sempre
+    // que essas barras apareciam. Agora rastreamos a resolução real do
+    // vídeo (via RendererEvents) e calculamos a área exata onde ele é
+    // desenhado, usando essa área (não a view inteira) como referência.
+    var videoSize by remember { mutableStateOf(IntSize.Zero) }
+
     AndroidView(
         modifier = Modifier
             .fillMaxSize()
@@ -682,14 +704,10 @@ fun RemoteVideoView(
                     while (true) {
                         val event = awaitPointerEvent()
                         val position = event.changes.firstOrNull()?.position ?: continue
-                        val w = viewSize.width
-                        val h = viewSize.height
-                        // Sem tamanho de view ainda (primeiro frame antes do
-                        // layout) — ignora o toque em vez de mandar uma
-                        // coordenada errada pro servidor.
-                        if (w <= 0 || h <= 0) continue
-                        val nx = (position.x / w).coerceIn(0f, 1f)
-                        val ny = (position.y / h).coerceIn(0f, 1f)
+                        val rect = videoContentRect(viewSize, videoSize)
+                        if (rect.width <= 0f || rect.height <= 0f) continue
+                        val nx = ((position.x - rect.left) / rect.width).coerceIn(0f, 1f)
+                        val ny = ((position.y - rect.top) / rect.height).coerceIn(0f, 1f)
 
                         when (event.type) {
                             PointerEventType.Press -> onControlEvent(ControlEvents.down(nx, ny))
@@ -702,13 +720,22 @@ fun RemoteVideoView(
             },
         factory = { ctx ->
             SurfaceViewRenderer(ctx).apply {
+                val rendererEvents = object : RendererCommon.RendererEvents {
+                    override fun onFirstFrameRendered() {}
+                    override fun onFrameResolutionChanged(videoWidth: Int, videoHeight: Int, rotation: Int) {
+                        val rotated = rotation == 90 || rotation == 270
+                        val size = if (rotated) IntSize(videoHeight, videoWidth) else IntSize(videoWidth, videoHeight)
+                        videoSize = size
+                        onFrameResolutionChanged(size)
+                    }
+                }
                 // Upscaling no lado do cliente: o servidor manda a tela do
                 // PC em resolução baixa de propósito (economiza CPU/rede no
                 // PC); aqui a GPU do celular amplia e aplica um realce de
                 // nitidez em tempo real (ver SharpUpscaleDrawer) em vez de
                 // usar o desenhista padrão do WebRTC (que só amplia "cru").
                 eglBaseContext?.let {
-                    init(it, null, EglBase.CONFIG_PLAIN, SharpUpscaleDrawer())
+                    init(it, rendererEvents, EglBase.CONFIG_PLAIN, SharpUpscaleDrawer())
                 }
                 setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                 setEnableHardwareScaler(true)
@@ -726,6 +753,38 @@ fun RemoteVideoView(
 }
 
 /**
+ * Calcula o retângulo (em pixels, dentro da view) onde o vídeo é
+ * REALMENTE desenhado. Usado tanto pro toque (RemoteVideoView) quanto
+ * pro cursor (CursorOverlay), pra garantir que os dois concordem com o
+ * que está de fato na tela — ver comentário em RemoteVideoView.
+ */
+private fun videoContentRect(boxSize: IntSize, videoSize: IntSize): Rect {
+    if (boxSize.width <= 0 || boxSize.height <= 0) {
+        return Rect(0f, 0f, 0f, 0f)
+    }
+    if (videoSize.width <= 0 || videoSize.height <= 0) {
+        // Ainda não recebemos nenhum frame — assume que ocupa a view
+        // inteira (melhor aproximação possível até o primeiro frame).
+        return Rect(0f, 0f, boxSize.width.toFloat(), boxSize.height.toFloat())
+    }
+    val boxAspect = boxSize.width.toFloat() / boxSize.height.toFloat()
+    val videoAspect = videoSize.width.toFloat() / videoSize.height.toFloat()
+    return if (videoAspect > boxAspect) {
+        // Vídeo "mais largo" que a view -> barras em cima/embaixo.
+        val displayW = boxSize.width.toFloat()
+        val displayH = displayW / videoAspect
+        val offsetY = (boxSize.height - displayH) / 2f
+        Rect(0f, offsetY, displayW, offsetY + displayH)
+    } else {
+        // Vídeo "mais alto" que a view -> barras nas laterais.
+        val displayH = boxSize.height.toFloat()
+        val displayW = displayH * videoAspect
+        val offsetX = (boxSize.width - displayW) / 2f
+        Rect(offsetX, 0f, offsetX + displayW, displayH)
+    }
+}
+
+/**
  * Item 3/4: desenha o cursor do mouse do PC por cima do vídeo.
  *
  * Antes, o servidor desenhava uma setinha DENTRO de cada frame de vídeo
@@ -739,7 +798,7 @@ fun RemoteVideoView(
  * lugar, só pra não ficar sem nada.
  */
 @Composable
-fun CursorOverlay(cursorState: CursorState, modifier: Modifier = Modifier) {
+fun CursorOverlay(cursorState: CursorState, videoFrameSize: IntSize, modifier: Modifier = Modifier) {
     var boxSize by remember { mutableStateOf(IntSize.Zero) }
 
     Box(
@@ -747,14 +806,18 @@ fun CursorOverlay(cursorState: CursorState, modifier: Modifier = Modifier) {
             .fillMaxSize()
             .onSizeChanged { boxSize = it },
     ) {
-        if (boxSize.width <= 0 || boxSize.height <= 0) return@Box
+        // Usa a mesma área real do vídeo que RemoteVideoView usa pro
+        // toque (ver videoContentRect) — sem isso, o cursor ficava
+        // deslocado sempre que o vídeo não ocupava a view inteira.
+        val contentRect = videoContentRect(boxSize, videoFrameSize)
+        if (contentRect.width <= 0f || contentRect.height <= 0f) return@Box
 
         val cursorSizeDp: Dp = 24.dp
         val density = LocalDensity.current
         val cursorSizePx = with(density) { cursorSizeDp.toPx() }
 
-        val xPx = cursorState.x * boxSize.width
-        val yPx = cursorState.y * boxSize.height
+        val xPx = contentRect.left + cursorState.x * contentRect.width
+        val yPx = contentRect.top + cursorState.y * contentRect.height
 
         val bitmap = cursorState.bitmap
         if (bitmap != null) {

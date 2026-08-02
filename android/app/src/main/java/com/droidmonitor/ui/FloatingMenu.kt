@@ -1,8 +1,15 @@
 package com.droidmonitor.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -43,6 +50,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -165,36 +173,48 @@ fun FloatingMenuHost(
                     })
                 },
         ) {
-            when (stage) {
-                MenuStage.COLLAPSED -> CollapsedButton(alpha = alpha.value)
-                MenuStage.EXPANDED -> ExpandedPanel(
-                    onQuality = { markInteraction(); stage = MenuStage.QUALITY },
-                    onMode = { markInteraction(); stage = MenuStage.MODE },
-                    onShortcuts = {
-                        markInteraction()
-                        stage = MenuStage.SHORTCUTS
-                        onRefreshShortcuts()
-                    },
-                    onSettings = { markInteraction(); onOpenSettings() },
-                    onDisconnect = { markInteraction(); onDisconnect() },
-                )
-                MenuStage.QUALITY -> QualityPanel(
-                    quality = quality,
-                    qualityLabels = qualityLabels,
-                    onBack = { markInteraction(); stage = MenuStage.EXPANDED },
-                    onSelect = { value -> markInteraction(); onQualityChange(value) },
-                )
-                MenuStage.MODE -> ModePanel(
-                    currentMode = currentMode,
-                    onBack = { markInteraction(); stage = MenuStage.EXPANDED },
-                    onSelect = { mode -> markInteraction(); onModeChange(mode) },
-                )
-                MenuStage.SHORTCUTS -> ShortcutsPanel(
-                    shortcuts = shortcuts,
-                    loading = shortcutsLoading,
-                    onBack = { markInteraction(); stage = MenuStage.EXPANDED },
-                    onExecute = { name -> markInteraction(); onExecuteShortcut(name) },
-                )
+            // Animação simples de abrir/fechar o menu e trocar de página
+            // (Qualidade/Modo/Atalhos) — um fade + leve "zoom" em vez de
+            // trocar de conteúdo abruptamente.
+            AnimatedContent(
+                targetState = stage,
+                transitionSpec = {
+                    (fadeIn(tween(160)) + scaleIn(initialScale = 0.92f, animationSpec = tween(160)))
+                        .togetherWith(fadeOut(tween(120)) + scaleOut(targetScale = 0.92f, animationSpec = tween(120)))
+                },
+                label = "floatingMenuStage",
+            ) { targetStage ->
+                when (targetStage) {
+                    MenuStage.COLLAPSED -> CollapsedButton(alpha = alpha.value)
+                    MenuStage.EXPANDED -> ExpandedPanel(
+                        onQuality = { markInteraction(); stage = MenuStage.QUALITY },
+                        onMode = { markInteraction(); stage = MenuStage.MODE },
+                        onShortcuts = {
+                            markInteraction()
+                            stage = MenuStage.SHORTCUTS
+                            onRefreshShortcuts()
+                        },
+                        onSettings = { markInteraction(); onOpenSettings() },
+                        onDisconnect = { markInteraction(); onDisconnect() },
+                    )
+                    MenuStage.QUALITY -> QualityPanel(
+                        quality = quality,
+                        qualityLabels = qualityLabels,
+                        onBack = { markInteraction(); stage = MenuStage.EXPANDED },
+                        onSelect = { value -> markInteraction(); onQualityChange(value) },
+                    )
+                    MenuStage.MODE -> ModePanel(
+                        currentMode = currentMode,
+                        onBack = { markInteraction(); stage = MenuStage.EXPANDED },
+                        onSelect = { mode -> markInteraction(); onModeChange(mode) },
+                    )
+                    MenuStage.SHORTCUTS -> ShortcutsPanel(
+                        shortcuts = shortcuts,
+                        loading = shortcutsLoading,
+                        onBack = { markInteraction(); stage = MenuStage.EXPANDED },
+                        onExecute = { name -> markInteraction(); onExecuteShortcut(name) },
+                    )
+                }
             }
         }
     }
@@ -231,9 +251,9 @@ private fun ExpandedPanel(
             .background(MenuBlack, RoundedCornerShape(14.dp))
             .padding(vertical = 8.dp),
     ) {
+        MenuRow(icon = Icons.Filled.HighQuality, label = stringResource(R.string.menu_quality), onClick = onQuality)
         MenuRow(icon = Icons.Filled.PhoneAndroid, label = stringResource(R.string.menu_mode), onClick = onMode)
         MenuRow(icon = Icons.Filled.KeyboardAlt, label = stringResource(R.string.menu_shortcuts), onClick = onShortcuts)
-        MenuRow(icon = Icons.Filled.HighQuality, label = stringResource(R.string.menu_quality), onClick = onQuality)
         MenuRow(icon = Icons.Filled.Settings, label = stringResource(R.string.menu_settings), onClick = onSettings)
         MenuRow(icon = Icons.Filled.LinkOff, label = stringResource(R.string.menu_disconnect), onClick = onDisconnect, danger = true)
     }
@@ -484,7 +504,27 @@ private fun QualityRow(label: String, selected: Boolean, onClick: () -> Unit) {
     }
 }
 
-/** Toque simples (tap) reutilizável para linhas de menu clicáveis. */
-private fun Modifier.tapClick(onClick: () -> Unit): Modifier = this.pointerInput(Unit) {
-    detectTapGestures(onTap = { onClick() })
+/** Toque simples (tap) reutilizável para linhas de menu clicáveis — com
+ *  uma pequena animação de "afundar" o botão enquanto ele é tocado
+ *  (animação de clique nos botões do menu flutuante). */
+@Composable
+private fun Modifier.tapClick(onClick: () -> Unit): Modifier {
+    var pressed by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.95f else 1f,
+        animationSpec = tween(120),
+        label = "menuRowPressScale",
+    )
+    return this
+        .graphicsLayer { scaleX = scale; scaleY = scale }
+        .pointerInput(Unit) {
+            detectTapGestures(
+                onPress = {
+                    pressed = true
+                    tryAwaitRelease()
+                    pressed = false
+                },
+                onTap = { onClick() },
+            )
+        }
 }

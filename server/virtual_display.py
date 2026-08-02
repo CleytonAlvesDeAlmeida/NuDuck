@@ -78,6 +78,37 @@ class XvfbVirtualDisplay:
         self._capture_ok = False
         self._mss_instance = None
 
+        # Correção de CPU alta no modo Estender: antes, esta thread
+        # capturava o framebuffer do Xvfb a ~30fps FIXO, o tempo todo —
+        # mesmo quando a qualidade escolhida pedia menos fps, e mesmo
+        # quando a tela estava parada (ver throttling de tela parada em
+        # server.py). Ou seja, era um segundo "motor" rodando na
+        # velocidade máxima por trás, gastando CPU à toa, independente
+        # do que a transmissão de vídeo realmente precisava. Agora o
+        # intervalo é ajustável (ver set_capture_interval), e o
+        # server.py mantém os dois sincronizados: quando a qualidade
+        # muda ou a tela fica parada, esta thread desacelera junto.
+        self._capture_interval = 1.0 / 30.0
+        self._capture_interval_lock = threading.Lock()
+
+        # Correção de bug (cursor "parado"/"não aparece" no modo Estender):
+        # a versão anterior usava uma thread separada perguntando pro X11
+        # (via Xlib) onde o mouse estava, ~20x/s. Isso depende de uma
+        # segunda conexão X11 própria ficar de pé o tempo todo — se essa
+        # conexão falhar silenciosamente (ex.: timing na inicialização do
+        # Xvfb, autenticação), a posição nunca é atualizada e o cursor no
+        # celular fica travado no valor padrão.
+        #
+        # Como o Xvfb não tem mouse físico nenhum — a ÚNICA forma da seta
+        # se mexer é através de send_input() (o toque do celular, via
+        # xdotool) — não faz sentido "perguntar" pro X11 onde o mouse
+        # está: nós mesmos JÁ SABEMOS, porque fomos nós que mandamos ele
+        # pra lá. Agora send_input() atualiza self._mouse_pos direto,
+        # sem nenhuma conexão/consulta extra — impossível "não bater" com
+        # a realidade, e uma thread a menos rodando o tempo todo.
+        self._mouse_pos = None
+        self._mouse_pos_lock = threading.Lock()
+
     def start(self):
         """Inicia o Xvfb + window manager + captura.
 
@@ -178,6 +209,7 @@ class XvfbVirtualDisplay:
 
         # Inicia captura (thread, não processo — sem leak de memória compartilhada)
         self._start_capture_thread()
+        # Idem para a posição do mouse — ver get_mouse_position().
 
         # Espera captura estabilizar e verifica
         time.sleep(3.0)
@@ -743,7 +775,20 @@ root.mainloop()
                 _fail_count[0] += 1
                 if _fail_count[0] == MAX_FAIL:
                     log.error("Captura falhou %dx consecutivas!", MAX_FAIL)
-            self._stop_event.wait(0.033)  # ~30fps
+            with self._capture_interval_lock:
+                interval = self._capture_interval
+            self._stop_event.wait(interval)
+
+    def set_capture_interval(self, interval: float):
+        """Ajusta o ritmo desta thread de captura em tempo real — chamado
+        pelo server.py sempre que a qualidade de vídeo muda ou quando a
+        tela fica parada por um tempo (throttling de tela parada), pra
+        manter as duas capturas (esta e a do vídeo em si) na mesma
+        velocidade em vez de uma rodar sempre no talo por trás da outra.
+        """
+        interval = max(1.0 / 60.0, min(2.0, interval))  # entre ~60fps e 0.5fps
+        with self._capture_interval_lock:
+            self._capture_interval = interval
 
     def _test_mss(self, display_name):
         """Testa captura via mss (biblioteca já usada no modo Espelhar).
@@ -975,6 +1020,8 @@ root.mainloop()
             self._capture_thread.join(timeout=3)
         self._capture_thread = None
 
+        # Idem pra thread de polling do mouse.
+
         # Fecha conexão mss (se estava sendo usada pra captura)
         if self._mss_instance is not None:
             try:
@@ -1174,6 +1221,8 @@ root.mainloop()
 
         # Reinicia captura
         self._start_capture_thread()
+        # Idem pro polling de mouse — a conexão X11 antiga não serve mais
+        # (o Xvfb foi recriado do zero).
 
         # Espera estabilizar
         time.sleep(2.0)
@@ -1206,49 +1255,20 @@ root.mainloop()
         return np.full(self._shape, [46, 26, 26], dtype=np.uint8)
 
     def get_mouse_position(self):
-        """Retorna a posição (x, y) do mouse no display virtual via xdotool.
-
-        Retorna (x, y) inteiros se sucesso, ou None se não conseguir.
-        Usa xdotool getmouselocation com DISPLAY do Xvfb.
+        """Retorna a última posição (x, y) que NÓS MESMOS mandamos o
+        cursor do display virtual pra (ver send_input) — leitura
+        instantânea, sem nenhuma consulta ao X11, então pode ser chamada
+        a cada frame de vídeo sem custo nenhum. `None` até o primeiro
+        toque chegar (o Xvfb não tem mouse físico nenhum, então não há
+        "posição inicial" real antes disso).
         """
-        if not self._started or not self.display_name:
-            return None
-        if not shutil.which("xdotool"):
-            return None
-
-        env = {**os.environ, "DISPLAY": self.display_name}
-        try:
-            result = subprocess.run(
-                ["xdotool", "getmouselocation", "--shell"],
-                env=env, capture_output=True, text=True, timeout=1,
-            )
-            if result.returncode != 0:
-                return None
-
-            # Parse saída: x=123\ny=456\n...
-            x = y = None
-            for line in result.stdout.strip().splitlines():
-                line = line.strip()
-                if line.startswith("X="):
-                    try:
-                        x = int(line.split("=")[1])
-                    except (ValueError, IndexError):
-                        pass
-                elif line.startswith("Y="):
-                    try:
-                        y = int(line.split("=")[1])
-                    except (ValueError, IndexError):
-                        pass
-
-            if x is not None and y is not None:
-                return (x, y)
-            return None
-        except Exception:
-            return None
+        with self._mouse_pos_lock:
+            return self._mouse_pos
 
     # ------------------------------------------------------------------
     # Input (toque do celular -> Xvfb via xdotool)
     # ------------------------------------------------------------------
+
 
     def send_input(self, action, x=0, y=0, key=None):
         """Envia clique/movimento/tecla pro display virtual."""
@@ -1256,6 +1276,16 @@ root.mainloop()
             return
         if not shutil.which("xdotool"):
             return
+
+        # Correção de bug (cursor "parado"/"não aparece" no modo
+        # Estender): a posição que a gente MANDA o cursor ir é a mesma
+        # que reportamos pro celular (ver get_mouse_position) — não tem
+        # como "não bater", porque é a mesma fonte. Atualiza ANTES de
+        # chamar o xdotool (não depois), pra já refletir o toque atual
+        # mesmo que o subprocess demore um pouco pra responder.
+        if action in ("mousemove", "click", "mousedown", "mouseup"):
+            with self._mouse_pos_lock:
+                self._mouse_pos = (int(x), int(y))
 
         env = {**os.environ, "DISPLAY": self.display_name}
         try:

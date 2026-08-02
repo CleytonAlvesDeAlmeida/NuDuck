@@ -256,6 +256,53 @@ vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
 
 ## Changelog
 
+### Atualização (02/08/2026) — Correções de mouse, modo Estender/Espelhar e menu
+- **Bug corrigido: não dava pra voltar do Estender pro Espelhar.** Causa
+  raiz: ao trocar de modo, o servidor não atualizava uma referência
+  interna pra transmissão nova — então, numa segunda troca de modo, ele
+  achava que já estava no modo pedido e não fazia nada. Corrigido; junto
+  com isso, também corrigi o cursor parando de funcionar depois de
+  trocar de modo (mesma causa).
+- **Bug corrigido: cursor "parado"/"não aparece" no modo Estender.** A
+  posição do cursor agora vem de uma fonte muito mais simples e
+  confiável — o próprio comando que o servidor manda pro cursor virtual
+  quando você toca a tela — em vez de depender de uma segunda conexão
+  com o X11 que podia falhar silenciosamente.
+- **Bug corrigido: cursor na posição errada no modo Espelhar.** O
+  WebRTC pode desenhar barras pretas próprias quando a proporção do
+  vídeo recebido não bate 100% com a da tela do celular (por causa de
+  um pequeno arredondamento de resolução) — nem o toque nem o cursor
+  levavam isso em conta antes. Agora os dois usam a área real onde o
+  vídeo é desenhado, calculada a partir da resolução de fato recebida.
+- **CPU alta no modo Estender.** Havia uma thread de captura interna
+  do Xvfb rodando sempre a ~30fps fixo, não importa a qualidade
+  escolhida nem se a tela estava parada — ela nunca desacelerava.
+  Agora acompanha o ritmo real da transmissão (incluindo o throttling
+  de tela parada). Além disso, enviar toques no modo Estender não
+  trava mais o restante do vídeo por um instante (rodava um processo
+  externo de forma bloqueante a cada toque/arrasto; agora roda em
+  segundo plano).
+- **Servidor limitado a 1 núcleo de CPU.** Além do `nice` (que já
+  existia), o processo agora fica travado num único núcleo — os
+  outros ficam livres pro resto do PC o tempo todo, não só quando há
+  disputa. **Importante:** com só 1 núcleo pra capturar e codificar o
+  vídeo, qualidades altas (720p/1080p) tendem a ficar mais lentas do
+  que ficavam antes — se notar isso, o mais indicado é usar 480p ou
+  menos (ou "Automático") nas configurações do app.
+- **Menu flutuante:** botões reordenados para Qualidade, Modo, Atalhos,
+  Configuração, Desconectar; adicionada uma animação simples de
+  abrir/fechar o menu (fade + zoom leve) e uma animação de "afundar"
+  ao tocar nos botões.
+
+**Não resolvido nesta rodada — "personalização do display":** não
+encontrei, no código atual, uma tela específica de "personalizar o
+display" que corresponda claramente ao que foi descrito (a única
+opção parecida hoje é "Clonar aparência para o Display 2", que copia
+tema/ícones/papel de parede do PC pro modo Estender). Se puder
+descrever com mais detalhe o que você espera personalizar (resolução?
+tema? outra coisa?) e onde no app/servidor essa opção deveria
+aparecer, eu implemento certinho na próxima rodada.
+
 ### Atualização (01/08/2026) — AMD CAS + cursor no celular + economia de CPU parado
 - **Nitidez trocada de "Unsharp Mask" para AMD CAS** (Contrast Adaptive
   Sharpening, do FidelityFX da AMD — algoritmo público/MIT). Diferença
