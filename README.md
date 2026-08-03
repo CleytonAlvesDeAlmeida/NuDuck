@@ -256,6 +256,32 @@ vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
 
 ## Changelog
 
+### Atualização (02/08/2026) — Correção: cursor "trava pra sempre" após um erro isolado
+- **Bug corrigido: o laço que manda a posição do cursor podia morrer
+  de vez.** Se qualquer coisa desse errado numa única atualização
+  (situação rara, mas possível), o laço inteiro parava pra sempre — e
+  o cursor ficava parado/invisível dali em diante, sem se recuperar
+  sozinho. Agora um erro isolado só pula aquela atualização; a próxima
+  (1/30 de segundo depois) tenta de novo normalmente, então o cursor
+  não fica mais travado permanentemente por causa de um problema
+  pontual.
+- Se isso ainda continuar acontecendo depois de atualizar, me manda o
+  que aparece no terminal do PC (onde o `server.py` está rodando)
+  enquanto o problema acontece — com uma mensagem de erro exata eu
+  consigo achar a causa certeira, em vez de eu ficar tentando adivinhar
+  cenários.
+
+### Atualização (02/08/2026) — Correção: toque errado no modo Estender
+- **Bug corrigido: o toque no modo Estender não descontava as barras
+  pretas do letterbox.** Essa correção já existia no modo Espelhar
+  (quando a proporção da tela do celular é diferente da do PC/display
+  virtual, o vídeo ganha barras pretas nas bordas) — mas só tinha sido
+  aplicada no caminho do modo Espelhar, não no do Estender. Resultado:
+  sempre que havia barras, o toque no modo Estender caía no lugar
+  errado. Apliquei a mesma correção nos dois caminhos agora, e validei
+  a matemática simulando vários pontos de toque — bateu certo em
+  todos.
+
 ### Atualização (02/08/2026) — Servidor agora usa 2 núcleos de CPU
 - O limite de CPU do servidor (que antes travava tudo em **1 núcleo
   só**) agora usa **2 núcleos**. Deixa mais folga pra capturar/codificar

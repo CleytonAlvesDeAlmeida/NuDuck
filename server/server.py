@@ -697,12 +697,23 @@ class ScreenCaptureTrack(VideoStreamTrack):
         (não tem processamento de imagem nenhum aqui), então não pesa
         CPU rodar sempre nesse ritmo, mesmo se o vídeo estiver devagar.
         """
-        try:
-            while True:
+        while True:
+            try:
                 self._send_cursor_update()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Correção: antes, se UMA atualização desse errado por
+                # qualquer motivo inesperado, o laço inteiro morria pra
+                # sempre — e o cursor ficava parado/invisível dali em
+                # diante, sem nenhum jeito de se recuperar sozinho.
+                # Agora um erro isolado só pula essa atualização; a
+                # próxima (1/30s depois) tenta de novo normalmente.
+                log.debug("Falha ao mandar atualização de cursor (ignorando, tentando de novo): %s", exc)
+            try:
                 await asyncio.sleep(1 / 30)
-        except asyncio.CancelledError:
-            pass
+            except asyncio.CancelledError:
+                break
 
     def _send_cursor_update(self):
         """Item 3/4: manda a posição — e, quando possível, o desenho real
@@ -1212,6 +1223,21 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
         if mtype in ("tap", "move", "down", "up"):
             x = min(max(float(msg.get("x", 0)), 0.0), 1.0)
             y = min(max(float(msg.get("y", 0)), 0.0), 1.0)
+
+            # Bug corrigido: essa mesma correção já existia no modo
+            # Espelhar (descontar as barras pretas do letterbox, quando
+            # a proporção do celular é diferente da do PC/display
+            # virtual), mas faltava aqui no modo Estender — o toque
+            # continuava indo direto, sem descontar nada, então caía no
+            # lugar errado sempre que havia barras. Ver _content_rect em
+            # ScreenCaptureTrack._letterbox.
+            rx0, ry0, rw, rh = screen_track._content_rect
+            if rw > 0 and rh > 0:
+                x = (x - rx0) / rw
+                y = (y - ry0) / rh
+            x = min(max(x, 0.0), 1.0)
+            y = min(max(y, 0.0), 1.0)
+
             vx, vy = int(x * vd.width), int(y * vd.height)
             action_map = {"tap": "click", "move": "mousemove", "down": "mousedown", "up": "mouseup"}
             loop.run_in_executor(None, vd.send_input, action_map.get(mtype, "mousemove"), vx, vy)

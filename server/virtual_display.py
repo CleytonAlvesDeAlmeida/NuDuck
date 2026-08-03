@@ -1342,9 +1342,9 @@ root.mainloop()
         """Retorna a última posição (x, y) que NÓS MESMOS mandamos o
         cursor do display virtual pra (ver send_input) — leitura
         instantânea, sem nenhuma consulta ao X11, então pode ser chamada
-        a cada frame de vídeo sem custo nenhum. `None` até o primeiro
-        toque chegar (o Xvfb não tem mouse físico nenhum, então não há
-        "posição inicial" real antes disso).
+        a cada frame de vídeo sem custo nenhum. Começa no centro da tela
+        (ver __init__) até o primeiro toque chegar, já que o Xvfb não
+        tem mouse físico nenhum, então não há "posição inicial" real.
         """
         with self._mouse_pos_lock:
             return self._mouse_pos
