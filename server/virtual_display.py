@@ -54,6 +54,75 @@ def stop_active_display():
         _active_display = None
 
 
+def _paint_wallpaper_pure_xlib(display_name: str, image_path: str) -> None:
+    """Pinta o papel de parede direto no root window via Xlib + Pillow —
+    sem depender de nenhum programa externo (feh, hsetroot, nitrogen...).
+
+    Correção do aviso "feh não está instalado": antes, sem o `feh`
+    instalado no PC, o papel de parede do display virtual (Estender)
+    simplesmente não aparecia — só um aviso no log pedindo pra instalar
+    o pacote. Só que `feh` é só um programinha que faz basicamente isto
+    aqui: redimensiona a imagem "cobrindo" a tela toda (preservando a
+    proporção, cortando o excesso) e desenha ela na janela-raiz do X.
+    Como o server já depende de `python-xlib` (usado pra detectar o
+    formato do cursor, ver item 4) e de `Pillow` (já vem com o
+    `qrcode[pil]`), dá pra fazer a mesma coisa sem exigir mais nenhum
+    pacote do sistema — então agora ISSO roda como alternativa quando o
+    `feh` não está instalado, em vez de só avisar e desistir.
+
+    Levanta uma exceção se algo der errado (a função que chama já trata
+    isso com try/except e cai no fallback de cor sólida, igual fazia
+    quando o feh falhava).
+    """
+    from Xlib import X, Xatom
+    from Xlib import display as xlib_display
+    from PIL import Image
+
+    d = xlib_display.Display(display_name)
+    try:
+        screen = d.screen()
+        root = screen.root
+        width, height = screen.width_in_pixels, screen.height_in_pixels
+        depth = screen.root_depth
+
+        img = Image.open(image_path).convert("RGB")
+        src_w, src_h = img.size
+        if src_w <= 0 or src_h <= 0:
+            raise ValueError("imagem de papel de parede com dimensões inválidas")
+
+        # Mesmo comportamento do "--bg-scale" do feh: preserva a
+        # proporção da imagem, preenche a tela toda e corta o excesso
+        # (em vez de esticar/distorcer ou deixar sobra).
+        scale = max(width / src_w, height / src_h)
+        new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        img = img.crop((left, top, left + width, top + height))
+
+        # BGRX de 32 bits é o layout de pixel mais comum em visuais
+        # true-color de desktops Linux (little-endian) — cobre a
+        # esmagadora maioria dos casos reais.
+        raw = img.tobytes("raw", "BGRX")
+
+        gc = root.create_gc()
+        pixmap = root.create_pixmap(width, height, depth)
+        pixmap.put_image(gc, 0, 0, width, height, X.ZPixmap, depth, 0, raw)
+
+        root.change_attributes(background_pixmap=pixmap)
+        root.clear_area(0, 0, width, height, exposures=False)
+
+        # Marca qual é o pixmap de fundo atual (_XROOTPMAP_ID) — é o
+        # jeito padrão de outros programas saberem "qual é o papel de
+        # parede", igual o feh também faz.
+        atom = d.intern_atom("_XROOTPMAP_ID")
+        root.change_property(atom, Xatom.PIXMAP, 32, [pixmap.id])
+
+        d.sync()
+    finally:
+        d.close()
+
+
 class XvfbVirtualDisplay:
     """Gerencia um display virtual Xvfb como segunda tela."""
 
@@ -106,7 +175,11 @@ class XvfbVirtualDisplay:
         # pra lá. Agora send_input() atualiza self._mouse_pos direto,
         # sem nenhuma conexão/consulta extra — impossível "não bater" com
         # a realidade, e uma thread a menos rodando o tempo todo.
-        self._mouse_pos = None
+        # Item novo: antes começava em None (cursor "invisível" até o
+        # primeiro toque chegar do celular) — agora começa no centro da
+        # tela, pra já aparecer alguma coisa assim que a transmissão
+        # começar, mesmo sem nenhum toque ainda.
+        self._mouse_pos = (width // 2, height // 2)
         self._mouse_pos_lock = threading.Lock()
 
     def start(self):
@@ -533,10 +606,21 @@ class XvfbVirtualDisplay:
                 except Exception as exc:
                     log.warning("Erro ao aplicar papel de parede via feh: %s", exc)
             else:
-                log.warning(
-                    "feh não está instalado — não é possível pintar o papel de parede no "
-                    "display virtual. Instale: sudo apt install feh"
-                )
+                # Correção do aviso "feh não está instalado": antes,
+                # sem o feh, o papel de parede simplesmente não
+                # aparecia. Agora usa Xlib + Pillow direto (mesmas
+                # dependências que o server já tem), sem precisar
+                # instalar mais nada no PC.
+                try:
+                    _paint_wallpaper_pure_xlib(self.display_name, wallpaper)
+                    applied_count += 1
+                    applied_wallpaper = True
+                    log.info("Papel de parede clonado (via Xlib, sem feh): %s", wallpaper)
+                except Exception as exc:
+                    log.warning(
+                        "Não consegui pintar o papel de parede sem o feh (%s). "
+                        "Alternativa: sudo apt install feh", exc,
+                    )
         elif wallpaper:
             log.warning("Papel de parede do display principal não encontrado no disco: %s", wallpaper)
         else:

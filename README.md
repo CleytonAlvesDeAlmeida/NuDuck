@@ -294,14 +294,22 @@ vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
   abrir/fechar o menu (fade + zoom leve) e uma animação de "afundar"
   ao tocar nos botões.
 
-**Não resolvido nesta rodada — "personalização do display":** não
-encontrei, no código atual, uma tela específica de "personalizar o
-display" que corresponda claramente ao que foi descrito (a única
-opção parecida hoje é "Clonar aparência para o Display 2", que copia
-tema/ícones/papel de parede do PC pro modo Estender). Se puder
-descrever com mais detalhe o que você espera personalizar (resolução?
-tema? outra coisa?) e onde no app/servidor essa opção deveria
-aparecer, eu implemento certinho na próxima rodada.
+- **Refinamento extra no cursor do modo Estender:** mesmo com a fonte
+  de posição já corrigida (comando enviado ao cursor virtual), o envio
+  dessa posição pro celular ainda rodava junto com o ritmo do vídeo —
+  que fica mais lento quando a tela não muda (economia de CPU). Como
+  mover o mouse no modo Estender nunca muda os pixels (o Xvfb não
+  desenha cursor), a atualização ficava "presa" nesse ritmo lento.
+  Agora roda à parte, no seu próprio ritmo fixo (~30x/s), independente
+  do vídeo. Também passei a mostrar o cursor no centro da tela assim
+  que conecta, em vez de ficar invisível até o primeiro toque.
+- **Papel de parede sem precisar instalar `feh`** (resposta à pergunta
+  sobre "personalizar o display" — era isso: o aviso "feh não está
+  instalado" no log). Antes, sem o `feh`, o papel de parede do Display
+  2 (modo Estender) simplesmente não aparecia. Agora, quando o `feh`
+  não está disponível, o server pinta o papel de parede sozinho (Xlib +
+  Pillow, bibliotecas que já são dependência do projeto) — sem precisar
+  instalar mais nada no PC.
 
 ### Atualização (01/08/2026) — AMD CAS + cursor no celular + economia de CPU parado
 - **Nitidez trocada de "Unsharp Mask" para AMD CAS** (Contrast Adaptive

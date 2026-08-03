@@ -528,6 +528,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # mandada como uma mensagem pequena pelo DataChannel, e o
         # celular desenha o cursor por conta própria, por cima do vídeo.
         self._control_channel = None
+        self._cursor_task = None
         self._last_cursor_serial = None
         self._xfixes_display = None
         self._xfixes_unavailable = False
@@ -673,6 +674,35 @@ class ScreenCaptureTrack(VideoStreamTrack):
             self._last_adapt = now
             self._load_ema = None
             log.info("Automático: subiu para %s", QUALITY_ORDER[self._auto_idx])
+
+    def start_cursor_loop(self):
+        """Correção: liga um laço PRÓPRIO pra mandar a posição do cursor,
+        separado do laço de vídeo. Chame uma vez, assim que a conexão for
+        criada."""
+        if self._cursor_task is None:
+            self._cursor_task = asyncio.ensure_future(self._cursor_loop())
+
+    async def _cursor_loop(self):
+        """Correção do bug "cursor congelado": antes, a atualização de
+        cursor só rodava dentro de recv() — junto com a captura de
+        vídeo. Só que o item 7 (economia de CPU com a tela parada)
+        deixa recv() mais lento quando os pixels não mudam. Só que mover
+        o mouse no modo Estender NUNCA muda os pixels capturados (o
+        Xvfb não desenha cursor nenhum) — e mover o mouse sobre uma área
+        vazia no modo Espelhar também costuma não mudar nada na tela.
+        Resultado: a atualização de cursor ficava "presa" no mesmo
+        ritmo lento do vídeo parado, dando a impressão de cursor
+        travado ou de que "o mouse real não aparece". Agora roda à
+        parte, num ritmo fixo (~30x/s) — é só uma mensagenzinha JSON
+        (não tem processamento de imagem nenhum aqui), então não pesa
+        CPU rodar sempre nesse ritmo, mesmo se o vídeo estiver devagar.
+        """
+        try:
+            while True:
+                self._send_cursor_update()
+                await asyncio.sleep(1 / 30)
+        except asyncio.CancelledError:
+            pass
 
     def _send_cursor_update(self):
         """Item 3/4: manda a posição — e, quando possível, o desenho real
@@ -1051,15 +1081,13 @@ class ScreenCaptureTrack(VideoStreamTrack):
         frame.time_base = self._time_base
         self._frame_count += 1
 
-        # Item 3/4: manda a posição (e, quando muda, o desenho) do
-        # cursor pro celular — está no thread do asyncio loop aqui
-        # (não no executor), então é seguro usar o DataChannel.
-        self._send_cursor_update()
-
         return frame
 
     def close(self):
         """Encerra a captura e fecha o display virtual."""
+        if self._cursor_task is not None:
+            self._cursor_task.cancel()
+            self._cursor_task = None
         if self._virtual_display:
             self._virtual_display.stop()
             self._virtual_display = None
@@ -1357,6 +1385,7 @@ async def websocket_handler(request: web.Request):
                     profile=profile,
                 )
                 pc.addTrack(relay.subscribe(screen_track))
+                screen_track.start_cursor_loop()
 
                 # Item 9: aplica bitrate máximo no RTPSender do vídeo, se
                 # suportado pelo aiortc. Em low_latency, limita a 2.5 Mbps.
@@ -1467,6 +1496,7 @@ async def websocket_handler(request: web.Request):
                     # sempre (continua aberto), só o track antigo é que
                     # "sabia" sobre ele.
                     new_track._control_channel = old_track._control_channel
+                    new_track.start_cursor_loop()
                     STATE.active_screen_track = new_track
                     STATE.current_mode = new_track.resolved_mode
                     # Para o track antigo (fecha Xvfb se estava em extend)
