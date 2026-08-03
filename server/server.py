@@ -26,17 +26,17 @@ import json
 import logging
 import os
 
-# Pedido: limitar o servidor a 1 núcleo/1 thread de CPU (ver também
+# Pedido: limitar o servidor a 2 núcleos/threads de CPU (ver também
 # os.sched_setaffinity em main(), mais abaixo). numpy/OpenCV usam, por
 # baixo dos panos, uma biblioteca de álgebra linear (BLAS/OpenMP) que
 # decide sozinha quantas threads usar — e ela só lê essas variáveis de
 # ambiente na hora que é carregada pela primeira vez. Por isso isso
 # precisa ficar bem no topo do arquivo, ANTES do `import numpy`, ou não
 # faz efeito nenhum.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
 
 import queue
 import secrets
@@ -2733,26 +2733,28 @@ def main():
     except (AttributeError, OSError):
         pass
 
-    # Pedido: limitar o servidor a 1 núcleo de CPU. Isso PRENDE o
-    # processo (e todas as threads dele) num único núcleo — não importa
-    # quantas threads internas alguma biblioteca decida abrir, todas vão
-    # disputar esse mesmo núcleo só, deixando os outros núcleos livres
+    # Pedido: limitar o servidor a 2 núcleos de CPU. Isso PRENDE o
+    # processo (e todas as threads dele) a exatamente 2 núcleos — não
+    # importa quantas threads internas alguma biblioteca decida abrir,
+    # todas vão disputar só esses 2, deixando os outros núcleos livres
     # pro resto do PC (navegador, etc.) o tempo todo, não só quando há
     # disputa (diferente do os.nice acima, que só ajuda em caso de
     # disputa). Só existe no Linux; em outros sistemas (ou se o Python
     # não tiver esse recurso disponível), simplesmente ignora.
     #
-    # Importante ficar ciente da troca feita aqui: com só 1 núcleo pra
-    # capturar E codificar o vídeo, qualidades mais altas (720p/1080p)
-    # tendem a ficar mais lentas/travadas do que ficavam antes. Se notar
-    # isso, o mais indicado é usar uma qualidade mais baixa (480p ou
-    # menos) ou automática nas configurações do app. Pra reverter esse
-    # limite, é só remover (ou comentar) este bloco.
+    # Importante ficar ciente da troca feita aqui: com só 2 núcleos pra
+    # capturar E codificar o vídeo, qualidades bem altas (1080p) ainda
+    # podem ficar mais lentas do que ficariam usando todos os núcleos.
+    # Se notar isso, o mais indicado é usar uma qualidade um pouco mais
+    # baixa (720p ou menos) ou automática nas configurações do app. Pra
+    # reverter esse limite, é só remover (ou comentar) este bloco. Pra
+    # mudar a quantidade de núcleos, é só ajustar o conjunto abaixo
+    # (ex.: {0, 1, 2} para 3 núcleos).
     try:
-        os.sched_setaffinity(0, {0})
-        log.info("Processo limitado ao núcleo de CPU 0 (pedido do usuário).")
+        os.sched_setaffinity(0, {0, 1})
+        log.info("Processo limitado aos núcleos de CPU 0 e 1 (pedido do usuário).")
     except (AttributeError, OSError) as exc:
-        log.debug("Não foi possível limitar a 1 núcleo (%s) — seguindo sem essa restrição.", exc)
+        log.debug("Não foi possível limitar a 2 núcleos (%s) — seguindo sem essa restrição.", exc)
 
     # Rede de segurança extra pro bug do x2x/Xvfb ficando órfão: cobre os
     # casos que não passam pelo botão "fechar janela" do Tkinter (matar o

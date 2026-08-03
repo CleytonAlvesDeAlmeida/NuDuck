@@ -256,6 +256,14 @@ vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
 
 ## Changelog
 
+### Atualização (02/08/2026) — Servidor agora usa 2 núcleos de CPU
+- O limite de CPU do servidor (que antes travava tudo em **1 núcleo
+  só**) agora usa **2 núcleos**. Deixa mais folga pra capturar/codificar
+  o vídeo em qualidades mais altas (720p, por exemplo) sem travar,
+  continuando a deixar os outros núcleos livres pro resto do PC.
+- Se um dia quiser ajustar de novo (mais ou menos núcleos), é só me
+  pedir — é uma mudança de uma linha só no `server.py`.
+
 ### Atualização (02/08/2026) — Correções de mouse, modo Estender/Espelhar e menu
 - **Bug corrigido: não dava pra voltar do Estender pro Espelhar.** Causa
   raiz: ao trocar de modo, o servidor não atualizava uma referência
