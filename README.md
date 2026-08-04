@@ -256,6 +256,20 @@ vídeo** (ex.: 480p ou 360p) nas configurações do app, ou usar
 
 ## Changelog
 
+### Atualização (02/08/2026) — Correção: mouse errado no modo "Espelhar Janela"
+- **Bug corrigido: no modo Espelhar Janela (capturar só uma janela, não
+  a tela toda), o cursor e o toque usavam a tela INTEIRA como
+  referência**, mesmo o vídeo mostrando só a janela recortada — uma
+  variável interna que deveria guardar "qual é a área real sendo
+  mostrada" nunca era preenchida de verdade. Corrigido nos dois
+  caminhos (toque e cursor desenhado), e validei a matemática
+  simulando toques em vários pontos de uma janela recortada — bateu
+  certo em todos.
+- Revisei o caminho completo do mouse nos dois modos (Espelhar e
+  Estender) — captura, letterbox, toque e cursor desenhado — e esse
+  foi o único bug de posição que encontrei que ainda não tinha sido
+  corrigido.
+
 ### Atualização (02/08/2026) — Correção: cursor "trava pra sempre" após um erro isolado
 - **Bug corrigido: o laço que manda a posição do cursor podia morrer
   de vez.** Se qualquer coisa desse errado numa única atualização

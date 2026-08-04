@@ -423,7 +423,13 @@ def _crop_window_from_frame(frame_bgr, monitor, geo):
         monitor:   dict do monitor do mss (contém left, top, width, height)
         geo:       dict da geometria da janela {x, y, width, height}
 
-    Retorna numpy array BGR recortado, ou None se fora dos limites.
+    Retorna (frame_recortado, rect_absoluto) — `rect_absoluto` é um dict
+    {left, top, width, height} em coordenadas ABSOLUTAS da tela,
+    já com os mesmos limites/recortes aplicados ao frame (importante:
+    é ESSA área, e não a `geo` "crua", que corresponde de verdade ao
+    que foi cortado — usada por ScreenCaptureTrack pra saber onde
+    mapear o cursor/toque corretamente). Retorna (None, None) se a
+    janela estiver fora dos limites do frame.
     """
     rel_x = geo["x"] - monitor["left"]
     rel_y = geo["y"] - monitor["top"]
@@ -438,9 +444,16 @@ def _crop_window_from_frame(frame_bgr, monitor, geo):
     h = min(h, src_h - rel_y)
 
     if w <= 0 or h <= 0:
-        return None
+        return None, None
 
-    return frame_bgr[rel_y:rel_y + h, rel_x:rel_x + w]
+    cropped = frame_bgr[rel_y:rel_y + h, rel_x:rel_x + w]
+    rect = {
+        "left": monitor["left"] + rel_x,
+        "top": monitor["top"] + rel_y,
+        "width": w,
+        "height": h,
+    }
+    return cropped, rect
 
 
 def _cursor_image_to_png_b64(cursor, max_size: int = 48) -> str:
@@ -1001,11 +1014,23 @@ class ScreenCaptureTrack(VideoStreamTrack):
                     log.debug("Não conseguiu obter geometria da janela %s", STATE.selected_window_id)
 
             if self._window_geo_cache is not None:
-                cropped = _crop_window_from_frame(img, self._monitor, self._window_geo_cache)
+                cropped, effective_rect = _crop_window_from_frame(img, self._monitor, self._window_geo_cache)
                 if cropped is not None and cropped.size > 0:
                     img = cropped
                     src_h, src_w = img.shape[:2]
-                    log.debug("Janela recortada: %dx%d", src_w, src_h)
+                    # Bug corrigido: o mouse (cursor E toque) usava
+                    # sempre a tela inteira como referência, mesmo no
+                    # modo "Espelhar Janela" — onde o vídeo mostra só
+                    # um pedaço recortado da tela. Isso fazia o cursor
+                    # e os toques caírem no lugar errado (relativo à
+                    # tela toda, não à janela). Agora guarda a área
+                    # REAL que está sendo mostrada, e _send_cursor_update
+                    # / handle_control_message usam ela como referência.
+                    self._effective_source_rect = effective_rect
+                else:
+                    self._effective_source_rect = None
+        else:
+            self._effective_source_rect = None
 
         # Item 6 (revisado): a versão anterior recortava a região central do
         # monitor para "preencher" a tela do celular sem barras pretas — mas
@@ -1249,7 +1274,19 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
             return
 
     # Input normal (pyautogui na tela principal do PC)
-    screen_w, screen_h = pyautogui.size()
+    # Bug corrigido: antes usava sempre pyautogui.size() (a tela
+    # inteira) como referência — mesmo no modo "Espelhar Janela", onde
+    # o vídeo mostra só um pedaço recortado da tela. Isso fazia o toque
+    # cair no lugar errado (relativo à tela toda, não à janela restrita
+    # que está sendo mostrada de verdade). Agora usa a mesma área
+    # "efetiva" que o cursor também usa (ver _send_cursor_update).
+    src_rect = screen_track._effective_source_rect
+    if src_rect:
+        origin_x, origin_y = src_rect["left"], src_rect["top"]
+        screen_w, screen_h = src_rect["width"], src_rect["height"]
+    else:
+        origin_x, origin_y = 0, 0
+        screen_w, screen_h = pyautogui.size()
 
     if mtype in ("tap", "move", "down", "up"):
         x = min(max(float(msg.get("x", 0)), 0.0), 1.0)
@@ -1267,7 +1304,7 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
         x = min(max(x, 0.0), 1.0)
         y = min(max(y, 0.0), 1.0)
 
-        px, py = int(x * screen_w), int(y * screen_h)
+        px, py = origin_x + int(x * screen_w), origin_y + int(y * screen_h)
 
         if mtype == "tap":
             pyautogui.click(px, py)
