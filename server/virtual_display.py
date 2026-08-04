@@ -1404,6 +1404,58 @@ root.mainloop()
                     ["xdotool", "key", "--", str(key)],
                     env=env, capture_output=True, timeout=1,
                 )
+            elif action == "scroll":
+                # Scroll com um dedo: xdotool click 4 (up) ou 5 (down)
+                # O terceiro parâmetro (key na assinatura) é reaproveitado
+                # como "amount" (int, positivo = up, negativo = down).
+                amount = int(key) if key else 0
+                btn = 4 if amount > 0 else 5 if amount < 0 else None
+                if btn:
+                    clicks = min(abs(amount), 10)  # limita a 10 cliques de uma vez
+                    subprocess.run(
+                        ["xdotool", "mousemove", "--", str(int(x)), str(int(y))],
+                        env=env, capture_output=True, timeout=1,
+                    )
+                    for _ in range(clicks):
+                        subprocess.run(
+                            ["xdotool", "click", "--", str(btn)],
+                            env=env, capture_output=True, timeout=1,
+                        )
+            elif action == "pinch_zoom":
+                # Pinch-to-zoom: simula Ctrl+scroll no Xvfb.
+                # O terceiro parâmetro (key na assinatura) é reaproveitado
+                # como scale_delta (float > 1.0 = zoom in, < 1.0 = zoom out).
+                try:
+                    scale_delta = float(key) if key else 1.0
+                except (ValueError, TypeError):
+                    scale_delta = 1.0
+                if abs(scale_delta - 1.0) < 0.01:
+                    return  # delta muito pequeno, ignora
+                # Move o cursor pro centro do pinch ANTES
+                subprocess.run(
+                    ["xdotool", "mousemove", "--", str(int(x)), str(int(y))],
+                    env=env, capture_output=True, timeout=1,
+                )
+                # Ctrl+scroll: positiva = zoom in (scroll up), negativa = zoom out (scroll down)
+                scroll_amount = int((scale_delta - 1.0) * 100)
+                scroll_amount = max(min(scroll_amount, 50), -50)  # limita
+                btn = 4 if scroll_amount > 0 else 5
+                clicks = max(abs(scroll_amount) // 10, 1)
+                subprocess.run(
+                    ["xdotool", "keydown", "ctrl"],
+                    env=env, capture_output=True, timeout=1,
+                )
+                try:
+                    for _ in range(clicks):
+                        subprocess.run(
+                            ["xdotool", "click", "--", str(btn)],
+                            env=env, capture_output=True, timeout=1,
+                        )
+                finally:
+                    subprocess.run(
+                        ["xdotool", "keyup", "ctrl"],
+                        env=env, capture_output=True, timeout=1,
+                    )
         except Exception:
             pass
 

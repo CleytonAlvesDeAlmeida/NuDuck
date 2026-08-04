@@ -21,4 +21,23 @@ object ControlEvents {
         put("type", "key")
         put("key", keyName)
     }
+
+    /** Scroll com um dedo. amount > 0 = para cima, < 0 = para baixo. */
+    fun scroll(x: Float, y: Float, amount: Int): JSONObject = JSONObject().apply {
+        put("type", "scroll")
+        put("x", x.coerceIn(0f, 1f))
+        put("y", y.coerceIn(0f, 1f))
+        put("amount", amount)
+    }
+
+    /** Pinch-to-zoom com dois dedos.
+     *  cx, cy: centro do pinch (normalizado 0-1).
+     *  scaleDelta: razão de escala (ex.: 1.1 = zoom in de 10%, 0.9 = zoom out de 10%).
+     */
+    fun pinchZoom(cx: Float, cy: Float, scaleDelta: Float): JSONObject = JSONObject().apply {
+        put("type", "pinch_zoom")
+        put("cx", cx.coerceIn(0f, 1f))
+        put("cy", cy.coerceIn(0f, 1f))
+        put("scale_delta", scaleDelta)
+    }
 }

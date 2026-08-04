@@ -735,6 +735,15 @@ class ScreenCaptureTrack(VideoStreamTrack):
         em vez de desenhar o cursor dentro de cada frame de vídeo (isso
         rodava em TODO frame, mesmo com o mouse parado). O celular
         desenha o cursor por conta própria, por cima do vídeo.
+
+        Bug corrigido: no modo Estender, se o Xvfb ainda não foi criado
+        (race condition: start_cursor_loop() roda antes do primeiro
+        recv() que chama _setup_mode()), enviava posição do monitor
+        principal — que não tem relação com o vídeo do Xvfb que o
+        celular está mostrando. Agora, no modo Estender sem Xvfb
+        pronto, envia o cursor no centro do display virtual (mesma
+        posição inicial que o Xvfb usa) em vez de cair no branch
+        do Espelhar.
         """
         channel = self._control_channel
         if channel is None or getattr(channel, "readyState", None) != "open":
@@ -754,6 +763,17 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 return
             cx, cy = pos
             src_w, src_h = self._virtual_display.width, self._virtual_display.height
+        elif self.mode == "extend" or self.resolved_mode == "extend":
+            # Bug corrigido: o cursor loop inicia ANTES do primeiro recv()
+            # (que é quem chama _setup_mode() e cria o Xvfb). Durante essa
+            # janela, _virtual_display é None mas o vídeo que o celular
+            # mostra é (ou em breve será) do Xvfb — enviar a posição do
+            # monitor principal aqui causa cursor na posição errada ou
+            # fora dos limites. Solução: envia o centro do display virtual
+            # (mesma posição default do Xvfb) até que ele esteja pronto.
+            src_w = self._phone_w if self._phone_w > 0 else 1280
+            src_h = self._phone_h if self._phone_h > 0 else 720
+            cx, cy = src_w // 2, src_h // 2
         else:
             try:
                 mx, my = pyautogui.position()
@@ -1325,6 +1345,38 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
             if key:
                 loop.run_in_executor(None, vd.send_input, "key", 0, 0, key)
             return
+        elif mtype == "scroll":
+            # Scroll com um dedo no display virtual (xdotool)
+            x = min(max(float(msg.get("x", 0.5)), 0.0), 1.0)
+            y = min(max(float(msg.get("y", 0.5)), 0.0), 1.0)
+            rx0, ry0, rw, rh = screen_track._content_rect
+            if rw > 0 and rh > 0:
+                x = (x - rx0) / rw
+                y = (y - ry0) / rh
+            x = min(max(x, 0.0), 1.0)
+            y = min(max(y, 0.0), 1.0)
+            vx = int(x * vd.width)
+            vy = int(y * vd.height)
+            amount = int(msg.get("amount", 0))
+            # Move o cursor pro ponto do scroll ANTES de rodar o scroll
+            loop.run_in_executor(None, vd.send_input, "scroll", vx, vy, amount)
+            return
+        elif mtype == "pinch_zoom":
+            # Pinch-to-zoom: simula Ctrl+scroll no display virtual
+            scale_delta = float(msg.get("scale_delta", 1.0))
+            # Centro do pinch (normalizado 0-1)
+            cx = min(max(float(msg.get("cx", 0.5)), 0.0), 1.0)
+            cy = min(max(float(msg.get("cy", 0.5)), 0.0), 1.0)
+            rx0, ry0, rw, rh = screen_track._content_rect
+            if rw > 0 and rh > 0:
+                cx = (cx - rx0) / rw
+                cy = (cy - ry0) / rh
+            cx = min(max(cx, 0.0), 1.0)
+            cy = min(max(cy, 0.0), 1.0)
+            vx = int(cx * vd.width)
+            vy = int(cy * vd.height)
+            loop.run_in_executor(None, vd.send_input, "pinch_zoom", vx, vy, scale_delta)
+            return
 
     # Input normal (pyautogui na tela principal do PC)
     # Bug corrigido: antes usava sempre pyautogui.size() (a tela
@@ -1375,6 +1427,48 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
                 pyautogui.press(key)
             except Exception:
                 log.debug("Tecla não reconhecida: %s", key)
+
+    elif mtype == "scroll":
+        x = min(max(float(msg.get("x", 0.5)), 0.0), 1.0)
+        y = min(max(float(msg.get("y", 0.5)), 0.0), 1.0)
+        rx0, ry0, rw, rh = screen_track._content_rect
+        if rw > 0 and rh > 0:
+            x = (x - rx0) / rw
+            y = (y - ry0) / rh
+        x = min(max(x, 0.0), 1.0)
+        y = min(max(y, 0.0), 1.0)
+        px = origin_x + int(x * screen_w)
+        py = origin_y + int(y * screen_h)
+        amount = int(msg.get("amount", 0))
+        try:
+            pyautogui.scroll(amount, x=px, y=py)
+        except Exception:
+            pass
+
+    elif mtype == "pinch_zoom":
+        # Pinch-to-zoom no modo Espelhar: simula Ctrl+scroll
+        scale_delta = float(msg.get("scale_delta", 1.0))
+        cx = min(max(float(msg.get("cx", 0.5)), 0.0), 1.0)
+        cy = min(max(float(msg.get("cy", 0.5)), 0.0), 1.0)
+        rx0, ry0, rw, rh = screen_track._content_rect
+        if rw > 0 and rh > 0:
+            cx = (cx - rx0) / rw
+            cy = (cy - ry0) / rh
+        cx = min(max(cx, 0.0), 1.0)
+        cy = min(max(cy, 0.0), 1.0)
+        px = origin_x + int(cx * screen_w)
+        py = origin_y + int(cy * screen_h)
+        # Ctrl+scroll pra zoom em aplicações que suportam
+        try:
+            pyautogui.keyDown("ctrl")
+            pyautogui.scroll(int((scale_delta - 1.0) * 100), x=px, y=py)
+        except Exception:
+            pass
+        finally:
+            try:
+                pyautogui.keyUp("ctrl")
+            except Exception:
+                pass
 
 
 # ==========================================================================
