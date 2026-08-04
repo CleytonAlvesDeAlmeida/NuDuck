@@ -545,6 +545,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._last_cursor_serial = None
         self._xfixes_display = None
         self._xfixes_unavailable = False
+        self._xfixes_display_name = None
         # Bug corrigido: no modo "Espelhar Janela" (só uma janela, não a
         # tela toda), a posição do cursor tem que ser relativa à JANELA
         # recortada, não ao monitor inteiro — senão o cursor aparece no
@@ -802,18 +803,40 @@ class ScreenCaptureTrack(VideoStreamTrack):
         silenciosamente — o app continua funcionando normalmente, só sem
         o desenho customizado do cursor (item 4); a posição (item 3)
         continua funcionando de qualquer forma.
+
+        Bug corrigido: no modo Estender, antes sempre conectava no
+        display principal (:0) via ``Display()`` — o cursor shape
+        vinha do monitor REAL, não do display virtual (Xvfb).
+        Como o Xvfb é um X server separado, o cursor dele é
+        independente; mostrar o cursor de :0 na tela do Xvfb causa
+        forma errada e, em alguns ambientes (Wayland/XWayland), a
+        consulta XFixes em :0 falha silenciosamente, deixando o cursor
+        invisível no celular. Agora, no modo Estender, conecta
+        diretamente no display do Xvfb.
         """
         if self._xfixes_unavailable or self._xfixes_display is not None:
             return
         try:
             from Xlib import display as _xlib_display
             import Xlib.ext.xfixes  # noqa: F401 — garante que a extensão registra os métodos
-            d = _xlib_display.Display()
+
+            # Bug corrigido: no modo Estender, conecta no display virtual
+            # (Xvfb) em vez do display principal (:0). O cursor shape
+            # deve vir do mesmo display que está sendo transmitido.
+            if self._virtual_display and self._virtual_display.is_running():
+                display_name = self._virtual_display.display_name
+            else:
+                display_name = None  # usa o display padrão (:0)
+
+            d = _xlib_display.Display(display_name)
             if not d.has_extension("XFIXES"):
                 self._xfixes_unavailable = True
                 return
             d.xfixes_query_version()
             self._xfixes_display = d
+            # Guarda o nome do display conectado pra poder detectar
+            # mudanças (ex.: troca Espelhar <-> Estender) e reconectar.
+            self._xfixes_display_name = display_name
         except Exception as exc:
             log.debug("XFixes indisponível para detectar o formato do cursor: %s", exc)
             self._xfixes_unavailable = True
@@ -826,7 +849,36 @@ class ScreenCaptureTrack(VideoStreamTrack):
         (a grande maioria dos frames não manda nada aqui — é barato).
         Devolve None se não há nada novo pra mandar, ou se a extensão
         XFixes não está disponível.
+
+        Bug corrigido: re-conecta o XFixes se o display alvo mudou
+        (ex.: troca de modo Espelhar <-> Estender). Antes a conexão
+        era reutilizada entre modos, apontando pro display errado
+        após a troca.
         """
+        # Bug corrigido: detecta mudança de display alvo (ex.: troca
+        # Espelhar <-> Estender) e re-conecta o XFixes pro display
+        # correto. Antes a conexão aberta em :0 era reutilizada mesmo
+        # depois de trocar para o Xvfb, mandando o cursor errado.
+        target_display = None
+        if self._virtual_display and self._virtual_display.is_running():
+            target_display = self._virtual_display.display_name
+
+        if self._xfixes_display is not None:
+            # Xlib Display não expõe o nome diretamente; comparamos
+            # via uma flag que gravamos ao criar a conexão.
+            current_display = getattr(self, '_xfixes_display_name', None)
+            if current_display != target_display:
+                log.debug("Display alvo do XFixes mudou (%s -> %s), reconectando",
+                          current_display, target_display)
+                try:
+                    self._xfixes_display.close()
+                except Exception:
+                    pass
+                self._xfixes_display = None
+                self._xfixes_unavailable = False
+                self._last_cursor_serial = None
+                self._xfixes_display_name = None
+
         self._init_xfixes()
         if self._xfixes_display is None:
             return None
@@ -1135,6 +1187,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
             except Exception:
                 pass
             self._xfixes_display = None
+            self._xfixes_display_name = None
         self._executor.shutdown(wait=False)
 
 
