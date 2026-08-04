@@ -545,7 +545,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._last_cursor_serial = None
         self._xfixes_display = None
         self._xfixes_unavailable = False
-        self._xfixes_display_name = None
         # Bug corrigido: no modo "Espelhar Janela" (só uma janela, não a
         # tela toda), a posição do cursor tem que ser relativa à JANELA
         # recortada, não ao monitor inteiro — senão o cursor aparece no
@@ -735,15 +734,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
         em vez de desenhar o cursor dentro de cada frame de vídeo (isso
         rodava em TODO frame, mesmo com o mouse parado). O celular
         desenha o cursor por conta própria, por cima do vídeo.
-
-        Bug corrigido: no modo Estender, se o Xvfb ainda não foi criado
-        (race condition: start_cursor_loop() roda antes do primeiro
-        recv() que chama _setup_mode()), enviava posição do monitor
-        principal — que não tem relação com o vídeo do Xvfb que o
-        celular está mostrando. Agora, no modo Estender sem Xvfb
-        pronto, envia o cursor no centro do display virtual (mesma
-        posição inicial que o Xvfb usa) em vez de cair no branch
-        do Espelhar.
         """
         channel = self._control_channel
         if channel is None or getattr(channel, "readyState", None) != "open":
@@ -763,17 +753,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 return
             cx, cy = pos
             src_w, src_h = self._virtual_display.width, self._virtual_display.height
-        elif self.mode == "extend" or self.resolved_mode == "extend":
-            # Bug corrigido: o cursor loop inicia ANTES do primeiro recv()
-            # (que é quem chama _setup_mode() e cria o Xvfb). Durante essa
-            # janela, _virtual_display é None mas o vídeo que o celular
-            # mostra é (ou em breve será) do Xvfb — enviar a posição do
-            # monitor principal aqui causa cursor na posição errada ou
-            # fora dos limites. Solução: envia o centro do display virtual
-            # (mesma posição default do Xvfb) até que ele esteja pronto.
-            src_w = self._phone_w if self._phone_w > 0 else 1280
-            src_h = self._phone_h if self._phone_h > 0 else 720
-            cx, cy = src_w // 2, src_h // 2
         else:
             try:
                 mx, my = pyautogui.position()
@@ -823,40 +802,18 @@ class ScreenCaptureTrack(VideoStreamTrack):
         silenciosamente — o app continua funcionando normalmente, só sem
         o desenho customizado do cursor (item 4); a posição (item 3)
         continua funcionando de qualquer forma.
-
-        Bug corrigido: no modo Estender, antes sempre conectava no
-        display principal (:0) via ``Display()`` — o cursor shape
-        vinha do monitor REAL, não do display virtual (Xvfb).
-        Como o Xvfb é um X server separado, o cursor dele é
-        independente; mostrar o cursor de :0 na tela do Xvfb causa
-        forma errada e, em alguns ambientes (Wayland/XWayland), a
-        consulta XFixes em :0 falha silenciosamente, deixando o cursor
-        invisível no celular. Agora, no modo Estender, conecta
-        diretamente no display do Xvfb.
         """
         if self._xfixes_unavailable or self._xfixes_display is not None:
             return
         try:
             from Xlib import display as _xlib_display
             import Xlib.ext.xfixes  # noqa: F401 — garante que a extensão registra os métodos
-
-            # Bug corrigido: no modo Estender, conecta no display virtual
-            # (Xvfb) em vez do display principal (:0). O cursor shape
-            # deve vir do mesmo display que está sendo transmitido.
-            if self._virtual_display and self._virtual_display.is_running():
-                display_name = self._virtual_display.display_name
-            else:
-                display_name = None  # usa o display padrão (:0)
-
-            d = _xlib_display.Display(display_name)
+            d = _xlib_display.Display()
             if not d.has_extension("XFIXES"):
                 self._xfixes_unavailable = True
                 return
             d.xfixes_query_version()
             self._xfixes_display = d
-            # Guarda o nome do display conectado pra poder detectar
-            # mudanças (ex.: troca Espelhar <-> Estender) e reconectar.
-            self._xfixes_display_name = display_name
         except Exception as exc:
             log.debug("XFixes indisponível para detectar o formato do cursor: %s", exc)
             self._xfixes_unavailable = True
@@ -869,36 +826,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         (a grande maioria dos frames não manda nada aqui — é barato).
         Devolve None se não há nada novo pra mandar, ou se a extensão
         XFixes não está disponível.
-
-        Bug corrigido: re-conecta o XFixes se o display alvo mudou
-        (ex.: troca de modo Espelhar <-> Estender). Antes a conexão
-        era reutilizada entre modos, apontando pro display errado
-        após a troca.
         """
-        # Bug corrigido: detecta mudança de display alvo (ex.: troca
-        # Espelhar <-> Estender) e re-conecta o XFixes pro display
-        # correto. Antes a conexão aberta em :0 era reutilizada mesmo
-        # depois de trocar para o Xvfb, mandando o cursor errado.
-        target_display = None
-        if self._virtual_display and self._virtual_display.is_running():
-            target_display = self._virtual_display.display_name
-
-        if self._xfixes_display is not None:
-            # Xlib Display não expõe o nome diretamente; comparamos
-            # via uma flag que gravamos ao criar a conexão.
-            current_display = getattr(self, '_xfixes_display_name', None)
-            if current_display != target_display:
-                log.debug("Display alvo do XFixes mudou (%s -> %s), reconectando",
-                          current_display, target_display)
-                try:
-                    self._xfixes_display.close()
-                except Exception:
-                    pass
-                self._xfixes_display = None
-                self._xfixes_unavailable = False
-                self._last_cursor_serial = None
-                self._xfixes_display_name = None
-
         self._init_xfixes()
         if self._xfixes_display is None:
             return None
@@ -1207,7 +1135,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
             except Exception:
                 pass
             self._xfixes_display = None
-            self._xfixes_display_name = None
         self._executor.shutdown(wait=False)
 
 
@@ -1345,38 +1272,6 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
             if key:
                 loop.run_in_executor(None, vd.send_input, "key", 0, 0, key)
             return
-        elif mtype == "scroll":
-            # Scroll com um dedo no display virtual (xdotool)
-            x = min(max(float(msg.get("x", 0.5)), 0.0), 1.0)
-            y = min(max(float(msg.get("y", 0.5)), 0.0), 1.0)
-            rx0, ry0, rw, rh = screen_track._content_rect
-            if rw > 0 and rh > 0:
-                x = (x - rx0) / rw
-                y = (y - ry0) / rh
-            x = min(max(x, 0.0), 1.0)
-            y = min(max(y, 0.0), 1.0)
-            vx = int(x * vd.width)
-            vy = int(y * vd.height)
-            amount = int(msg.get("amount", 0))
-            # Move o cursor pro ponto do scroll ANTES de rodar o scroll
-            loop.run_in_executor(None, vd.send_input, "scroll", vx, vy, amount)
-            return
-        elif mtype == "pinch_zoom":
-            # Pinch-to-zoom: simula Ctrl+scroll no display virtual
-            scale_delta = float(msg.get("scale_delta", 1.0))
-            # Centro do pinch (normalizado 0-1)
-            cx = min(max(float(msg.get("cx", 0.5)), 0.0), 1.0)
-            cy = min(max(float(msg.get("cy", 0.5)), 0.0), 1.0)
-            rx0, ry0, rw, rh = screen_track._content_rect
-            if rw > 0 and rh > 0:
-                cx = (cx - rx0) / rw
-                cy = (cy - ry0) / rh
-            cx = min(max(cx, 0.0), 1.0)
-            cy = min(max(cy, 0.0), 1.0)
-            vx = int(cx * vd.width)
-            vy = int(cy * vd.height)
-            loop.run_in_executor(None, vd.send_input, "pinch_zoom", vx, vy, scale_delta)
-            return
 
     # Input normal (pyautogui na tela principal do PC)
     # Bug corrigido: antes usava sempre pyautogui.size() (a tela
@@ -1427,48 +1322,6 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
                 pyautogui.press(key)
             except Exception:
                 log.debug("Tecla não reconhecida: %s", key)
-
-    elif mtype == "scroll":
-        x = min(max(float(msg.get("x", 0.5)), 0.0), 1.0)
-        y = min(max(float(msg.get("y", 0.5)), 0.0), 1.0)
-        rx0, ry0, rw, rh = screen_track._content_rect
-        if rw > 0 and rh > 0:
-            x = (x - rx0) / rw
-            y = (y - ry0) / rh
-        x = min(max(x, 0.0), 1.0)
-        y = min(max(y, 0.0), 1.0)
-        px = origin_x + int(x * screen_w)
-        py = origin_y + int(y * screen_h)
-        amount = int(msg.get("amount", 0))
-        try:
-            pyautogui.scroll(amount, x=px, y=py)
-        except Exception:
-            pass
-
-    elif mtype == "pinch_zoom":
-        # Pinch-to-zoom no modo Espelhar: simula Ctrl+scroll
-        scale_delta = float(msg.get("scale_delta", 1.0))
-        cx = min(max(float(msg.get("cx", 0.5)), 0.0), 1.0)
-        cy = min(max(float(msg.get("cy", 0.5)), 0.0), 1.0)
-        rx0, ry0, rw, rh = screen_track._content_rect
-        if rw > 0 and rh > 0:
-            cx = (cx - rx0) / rw
-            cy = (cy - ry0) / rh
-        cx = min(max(cx, 0.0), 1.0)
-        cy = min(max(cy, 0.0), 1.0)
-        px = origin_x + int(cx * screen_w)
-        py = origin_y + int(cy * screen_h)
-        # Ctrl+scroll pra zoom em aplicações que suportam
-        try:
-            pyautogui.keyDown("ctrl")
-            pyautogui.scroll(int((scale_delta - 1.0) * 100), x=px, y=py)
-        except Exception:
-            pass
-        finally:
-            try:
-                pyautogui.keyUp("ctrl")
-            except Exception:
-                pass
 
 
 # ==========================================================================

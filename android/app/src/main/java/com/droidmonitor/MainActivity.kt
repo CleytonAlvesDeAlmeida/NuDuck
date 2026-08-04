@@ -55,22 +55,20 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.foundation.layout.offset
@@ -79,7 +77,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import kotlin.math.roundToInt
-import kotlin.math.sqrt
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import com.droidmonitor.discovery.PcInfo
@@ -703,80 +700,21 @@ fun RemoteVideoView(
         modifier = Modifier
             .fillMaxSize()
             .onSizeChanged { viewSize = it }
-            .pointerInput(viewSize) {
+            .pointerInput(Unit) {
                 awaitPointerEventScope {
-                    var isPinch = false
-                    var lastPinchDistance = 0f
-                    var pinchAccumulatedDelta = 1.0f
-
                     while (true) {
                         val event = awaitPointerEvent()
-                        val changes = event.changes
+                        val position = event.changes.firstOrNull()?.position ?: continue
+                        val rect = videoContentRect(viewSize, videoSize)
+                        if (rect.width <= 0f || rect.height <= 0f) continue
+                        val nx = ((position.x - rect.left) / rect.width).coerceIn(0f, 1f)
+                        val ny = ((position.y - rect.top) / rect.height).coerceIn(0f, 1f)
 
-                        // --- Pinch-to-zoom com dois dedos ---
-                        if (changes.size >= 2) {
-                            val p0 = changes[0].position
-                            val p1 = changes[1].position
-                            val dist = sqrt((p1.x - p0.x) * (p1.x - p0.x) + (p1.y - p0.y) * (p1.y - p0.y))
-
-                            val rect = videoContentRect(viewSize, videoSize)
-                            if (rect.width > 0f && rect.height > 0f) {
-                                val cx = ((p0.x + p1.x) / 2f)
-                                val cy = ((p0.y + p1.y) / 2f)
-                                val ncx = ((cx - rect.left) / rect.width).coerceIn(0f, 1f)
-                                val ncy = ((cy - rect.top) / rect.height).coerceIn(0f, 1f)
-
-                                if (!isPinch) {
-                                    isPinch = true
-                                    lastPinchDistance = dist
-                                    pinchAccumulatedDelta = 1.0f
-                                } else if (lastPinchDistance > 0f) {
-                                    val ratio = dist / lastPinchDistance
-                                    pinchAccumulatedDelta *= ratio
-                                    // Envia evento de pinch zoom quando o delta acumulado
-                                            // passa de um limiar (evita spam de eventos)
-                                    if (kotlin.math.abs(pinchAccumulatedDelta - 1.0f) > 0.05f) {
-                                        onControlEvent(ControlEvents.pinchZoom(ncx, ncy, pinchAccumulatedDelta))
-                                        pinchAccumulatedDelta = 1.0f
-                                    }
-                                }
-                                lastPinchDistance = dist
-                            }
-                            changes.forEach { it.consume() }
-                            continue
-                        }
-
-                        // Fim do pinch: se estava em pinch e agora tem menos dedos
-                        if (isPinch && changes.size < 2) {
-                            // Se sobrou acumulado, envia
-                            if (kotlin.math.abs(pinchAccumulatedDelta - 1.0f) > 0.02f) {
-                                val rect = videoContentRect(viewSize, videoSize)
-                                if (rect.width > 0f && rect.height > 0f) {
-                                    val ncx = 0.5f
-                                    val ncy = 0.5f
-                                    onControlEvent(ControlEvents.pinchZoom(ncx, ncy, pinchAccumulatedDelta))
-                                }
-                            }
-                            isPinch = false
-                            lastPinchDistance = 0f
-                            pinchAccumulatedDelta = 1.0f
-                        }
-
-                        // --- Toque simples (1 dedo) ---
-                        if (changes.size == 1 && !isPinch) {
-                            val position = changes[0].position
-                            val rect = videoContentRect(viewSize, videoSize)
-                            if (rect.width > 0f && rect.height > 0f) {
-                                val nx = ((position.x - rect.left) / rect.width).coerceIn(0f, 1f)
-                                val ny = ((position.y - rect.top) / rect.height).coerceIn(0f, 1f)
-
-                                when (event.type) {
-                                    PointerEventType.Press -> onControlEvent(ControlEvents.down(nx, ny))
-                                    PointerEventType.Move -> onControlEvent(ControlEvents.move(nx, ny))
-                                    PointerEventType.Release -> onControlEvent(ControlEvents.up(nx, ny))
-                                    else -> {}
-                                }
-                            }
+                        when (event.type) {
+                            PointerEventType.Press -> onControlEvent(ControlEvents.down(nx, ny))
+                            PointerEventType.Move -> onControlEvent(ControlEvents.move(nx, ny))
+                            PointerEventType.Release -> onControlEvent(ControlEvents.up(nx, ny))
+                            else -> {}
                         }
                     }
                 }
@@ -875,7 +813,7 @@ fun CursorOverlay(cursorState: CursorState, videoFrameSize: IntSize, modifier: M
         val contentRect = videoContentRect(boxSize, videoFrameSize)
         if (contentRect.width <= 0f || contentRect.height <= 0f) return@Box
 
-        val cursorSizeDp: Dp = 28.dp
+        val cursorSizeDp: Dp = 24.dp
         val density = LocalDensity.current
         val cursorSizePx = with(density) { cursorSizeDp.toPx() }
 
@@ -896,17 +834,12 @@ fun CursorOverlay(cursorState: CursorState, videoFrameSize: IntSize, modifier: M
                     .size(cursorSizeDp),
             )
         } else {
-            // Setinha genérica de fallback com borda escura + sombra pra
-            // ficar visível em QUALQUER fundo (claro ou escuro).
-            // Bug corrigido: a versão anterior era branca com borda fina
-            // preta — ficava invisível em fundos claros (como o
-            // wallpaper padrão do Xvfb no modo Estender).
-            val tipX = xPx.roundToInt()
-            val tipY = yPx.roundToInt()
-            // Sombra (deslocada 2px pra baixo e direita)
+            // Setinha genérica de fallback (mesmo desenho que o servidor
+            // usava antes de embutir no vídeo), só até a primeira forma
+            // real chegar do PC.
             Canvas(
                 modifier = Modifier
-                    .offset { IntOffset(tipX + 2, tipY + 2) }
+                    .offset { IntOffset(xPx.roundToInt(), yPx.roundToInt()) }
                     .size(cursorSizeDp),
             ) {
                 val w = size.width
@@ -921,29 +854,8 @@ fun CursorOverlay(cursorState: CursorState, videoFrameSize: IntSize, modifier: M
                     lineTo(w * 0.85f, h * 0.45f)
                     close()
                 }
-                drawPath(path, color = Color.Black.copy(alpha = 0.5f))
-            }
-            // Seta principal: preta por dentro, borda branca por fora
-            Canvas(
-                modifier = Modifier
-                    .offset { IntOffset(tipX, tipY) }
-                    .size(cursorSizeDp),
-            ) {
-                val w = size.width
-                val h = size.height
-                val path = Path().apply {
-                    moveTo(0f, 0f)
-                    lineTo(0f, h * 0.78f)
-                    lineTo(w * 0.35f, h * 0.58f)
-                    lineTo(w * 0.55f, h * 1.0f)
-                    lineTo(w * 0.70f, h * 0.90f)
-                    lineTo(w * 0.50f, h * 0.52f)
-                    lineTo(w * 0.85f, h * 0.45f)
-                    close()
-                }
-                // Preenchimento escuro + borda clara = visível em qualquer fundo
-                drawPath(path, color = Color(0xFF222222))
-                drawPath(path, color = Color.White, style = Stroke(width = 2f))
+                drawPath(path, color = Color.White)
+                drawPath(path, color = Color.Black, style = Stroke(width = 1.5f))
             }
         }
     }
