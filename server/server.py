@@ -598,6 +598,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # espelhar janela em ~30-40%.
         self._composite_geo_cache = None    # {width, height, left, top, frame}
         self._composite_geo_frame = 0
+        # Cache do objeto window Xlib — evita create_resource_object
+        # por frame (small overhead, mas conta no total de round-trips).
+        self._composite_window_obj = None
 
         # Item 7: se a tela não muda por vários frames seguidos (ex.:
         # usuário parado lendo algo), aumenta gradualmente o intervalo
@@ -952,12 +955,20 @@ class ScreenCaptureTrack(VideoStreamTrack):
             from Xlib import X
             from Xlib.ext import composite
 
-            window = d.create_resource_object("window", window_id)
+            # Cache do objeto window Xlib — evita create_resource_object
+            # por frame ( economiza 1 round-trip X por frame).
+            if (self._composite_window_obj is None
+                    or self._composite_window_id != window_id):
+                window = d.create_resource_object("window", window_id)
+                self._composite_window_obj = window
+            else:
+                window = self._composite_window_obj
 
             if self._composite_window_id != window_id:
                 self._composite_release()
                 window.composite_redirect_window(composite.RedirectAutomatic)
                 self._composite_window_id = window_id
+                self._composite_window_obj = window
                 # Janela mudou — invalida o cache de geometria pra forçar
                 # releitura no primeiro frame da nova janela.
                 self._composite_geo_cache = None
@@ -1048,6 +1059,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # sair do modo janela, o cache antigo não serve mais.
         self._composite_geo_cache = None
         self._composite_geo_frame = 0
+        self._composite_window_obj = None
 
     def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
@@ -1181,32 +1193,39 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # Se STATE.window_mode=True e janela selecionada, recorta só a janela
         # do frame completo. A geometria é cacheada (atualizada ~1x/s)
         # para evitar subprocess por frame.
-        if self._sct is None:
-            self._sct = mss.mss()
-            if self._explicit_region is not None:
-                self._monitor = self._explicit_region
-            else:
-                self._monitor = self._sct.monitors[self._monitor_index]
 
-        raw = self._sct.grab(self._monitor)
-        img = np.array(raw)[:, :, :3]  # BGRA -> BGR (fica em BGR o tempo todo)
-        src_h, src_w = img.shape[:2]
+        # --- OTIMIZAÇÃO MODO JANELA: tenta Composite ANTES do mss.grab() ---
+        # Antes, o código fazia mss.grab() (captura de TELA CHEIA, ~5-15ms)
+        # em TODO frame — mesmo no modo janela, onde o resultado era
+        # descartado quando o Composite funcionava. Isso era o maior
+        # gargalo de performance do modo janela. Agora, no modo janela,
+        # tentamos o Composite PRIMEIRO; só fazemos mss.grab() se o
+        # Composite falhar (rede de segurança para o recorte de tela cheia).
+        # Economiza 5-15ms por frame => FPS real muito maior no modo janela.
+        img = None
+        src_h = src_w = 0
 
-        # --- Modo Espelhar Janela: mostra só a janela selecionada ---
         if STATE.window_mode and STATE.selected_window_id:
-            # Primeiro tenta via Composite — continua funcionando mesmo
-            # com a janela atrás de outra (ou com o menu flutuante do
-            # celular na frente). Ver _capture_window_composite().
+            # Tenta Composite primeiro (não precisa de captura de tela cheia)
             win_img, effective_rect = self._capture_window_composite(STATE.selected_window_id)
             if win_img is not None:
                 img = win_img
                 src_h, src_w = img.shape[:2]
                 self._effective_source_rect = effective_rect
             else:
-                # Não deu — cai no método antigo (recorte da captura de
-                # tela cheia): só mostra a janela se ela estiver
-                # fisicamente visível, mas pelo menos continua
-                # funcionando em vez de travar tudo.
+                # Composite falhou — rede de segurança: captura tela cheia
+                # e recorta a janela (só funciona se a janela estiver visível)
+                if self._sct is None:
+                    self._sct = mss.mss()
+                    if self._explicit_region is not None:
+                        self._monitor = self._explicit_region
+                    else:
+                        self._monitor = self._sct.monitors[self._monitor_index]
+
+                raw = self._sct.grab(self._monitor)
+                full_img = np.array(raw)[:, :, :3]
+                src_h_full, src_w_full = full_img.shape[:2]
+
                 if (self._window_geo_cache is None or
                         self._frame_count - self._window_geo_frame >= 30):
                     geo = _get_window_geometry(STATE.selected_window_id)
@@ -1217,28 +1236,37 @@ class ScreenCaptureTrack(VideoStreamTrack):
                         log.debug("Não conseguiu obter geometria da janela %s", STATE.selected_window_id)
 
                 if self._window_geo_cache is not None:
-                    cropped, crop_rect = _crop_window_from_frame(img, self._monitor, self._window_geo_cache)
+                    cropped, crop_rect = _crop_window_from_frame(full_img, self._monitor, self._window_geo_cache)
                     if cropped is not None and cropped.size > 0:
                         img = cropped
                         src_h, src_w = img.shape[:2]
-                        # Bug corrigido: o mouse (cursor E toque) usava
-                        # sempre a tela inteira como referência, mesmo
-                        # no modo "Espelhar Janela" — onde o vídeo
-                        # mostra só um pedaço recortado da tela. Isso
-                        # fazia o cursor e os toques caírem no lugar
-                        # errado (relativo à tela toda, não à janela).
-                        # Agora guarda a área REAL que está sendo
-                        # mostrada, e _send_cursor_update /
-                        # handle_control_message usam ela como referência.
                         self._effective_source_rect = crop_rect
                     else:
                         self._effective_source_rect = None
                 else:
                     self._effective_source_rect = None
+
+                # Se nem o recorte funcionou, usa a tela cheia como fallback
+                if img is None:
+                    img = full_img
+                    src_h, src_w = src_h_full, src_w_full
+                    self._effective_source_rect = None
         else:
+            # Modo espelhar tela inteira: mss.grab() normal
             if self._composite_window_id is not None:
                 self._composite_release()
             self._effective_source_rect = None
+
+            if self._sct is None:
+                self._sct = mss.mss()
+                if self._explicit_region is not None:
+                    self._monitor = self._explicit_region
+                else:
+                    self._monitor = self._sct.monitors[self._monitor_index]
+
+            raw = self._sct.grab(self._monitor)
+            img = np.array(raw)[:, :, :3]  # BGRA -> BGR
+            src_h, src_w = img.shape[:2]
 
         # Item 6 (revisado): a versão anterior recortava a região central do
         # monitor para "preencher" a tela do celular sem barras pretas — mas
@@ -1249,10 +1277,19 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # aspect ratio realmente não bate com o do celular.
         target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-        # Item 9: em low_latency, sempre INTER_NEAREST (mais rápido).
-        interp = cv2.INTER_NEAREST if self._is_low_latency else (
-            cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
-        )
+        # OTIMIZAÇÃO MODO JANELA: sempre INTER_NEAREST no modo janela.
+        # Janelas têm conteúdo dinâmico (vídeos, animações, scroll), então
+        # a nitidez extra do INTER_LINEAR quase não é percebida — mas o
+        # custo de CPU sim (~30-50% mais lento que INTER_NEAREST). No
+        # modo janela, priorizamos FPS/latência sobre nitidez.
+        in_window_mode = bool(STATE.window_mode and STATE.selected_window_id)
+        if in_window_mode:
+            interp = cv2.INTER_NEAREST
+        else:
+            # Item 9: em low_latency, sempre INTER_NEAREST (mais rápido).
+            interp = cv2.INTER_NEAREST if self._is_low_latency else (
+                cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
+            )
         frame_resized = cv2.resize(img, (target_w, target_h), interpolation=interp)
 
         # Item 3: cursor não é mais desenhado aqui — ver
@@ -1264,7 +1301,18 @@ class ScreenCaptureTrack(VideoStreamTrack):
             frame_resized = self._letterbox(frame_resized)
 
         frame_resized = np.ascontiguousarray(frame_resized)
-        changed = self._update_frame_fingerprint(frame_resized)
+
+        # OTIMIZAÇÃO MODO JANELA: pula o fingerprint de frame no modo janela.
+        # O fingerprint (CRC32 de uma amostra a cada 16px) é usado para
+        # detectar "tela parada" e reduzir FPS quando nada muda. Mas no
+        # modo janela, o conteúdo muda frequentemente (vídeos, animações)
+        # e mesmo parado, o usuário geralmente está esperando algo. Pular
+        # o fingerprint garante FPS máximo no modo janela, sem o overhead
+        # de calcular CRC32 em cada frame.
+        if in_window_mode:
+            changed = True
+        else:
+            changed = self._update_frame_fingerprint(frame_resized)
         return VideoFrame.from_ndarray(frame_resized, format="bgr24"), changed
 
     def _update_frame_fingerprint(self, frame_bgr) -> bool:
@@ -1503,27 +1551,25 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
         origin_x, origin_y = 0, 0
         screen_w, screen_h = pyautogui.size()
 
-    # Modo Espelhar Janela: o toque tem que ir pra JANELA COMPARTILHADA,
-    # não pra janela que estiver na frente dela na tela do PC. O Composite
-    # captura o conteúdo da janela mesmo com outra por cima (ver
-    # _capture_window_composite), mas o pyautogui.click(px, py) clica na
-    # posição absoluta da tela — atingindo qualquer janela que esteja
-    # visível ali, não necessariamente a compartilhada.
-    #
-    # Solução SEM trazer a janela para frente: usar
-    #   xdotool mousemove --window <WID> <relx> <rely> [click|mousedown|mouseup] 1
-    # Isso move o cursor para a posição RELATIVA à janela WID (não pra frente
-    # dela — apenas posiciona o cursor visualmente dentro da janela) e em
-    # seguida envia o evento de clique. A janela compartilhada continua
-    # atrás das outras, mas o clique é entregue pra ela via xdotool.
-    #
-    # Limitações:
-    # - O cursor VISÍVEL do PC se move para a posição clicada (impossível
-    #   evitar movendo cursor + clicando via XTEST — só daria pra evitar
-    #   via XSendEvent puro, que muitos apps modernos ignoram).
-    # - Gerenciadores de janela com "focus follows mouse" podem focar a
-    #   janela (mas sem trazê-la para frente).
-    use_xdotool_window = (STATE.window_mode and STATE.selected_window_id)
+    # Modo Espelhar Janela: sem funções de toque.
+    # O modo janela é otimizado apenas para ESPELHAR (visualizar) o
+    # conteúdo da janela — controle de toque/mouse foi removido pra
+    # focar em performance de captura. Toques vindos do celular são
+    # ignorados silenciosamente nesse modo. Use o modo "Espelhar tela
+    # inteira" para ter controle de toque.
+    if STATE.window_mode and STATE.selected_window_id:
+        if mtype in ("tap", "move", "down", "up"):
+            return
+        # Teclas continuam funcionando no modo janela (são globais ao
+        # display, não dependem de janela específica).
+        if mtype == "key":
+            key = msg.get("key")
+            if key:
+                try:
+                    pyautogui.press(key)
+                except Exception:
+                    log.debug("Tecla não reconhecida: %s", key)
+        return
 
     if mtype in ("tap", "move", "down", "up"):
         x = min(max(float(msg.get("x", 0)), 0.0), 1.0)
@@ -1541,48 +1587,18 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
         x = min(max(x, 0.0), 1.0)
         y = min(max(y, 0.0), 1.0)
 
-        if use_xdotool_window:
-            # Coordenadas relativas à janela (não absolutas da tela).
-            rel_x = int(x * screen_w)
-            rel_y = int(y * screen_h)
-            cmd = ["xdotool", "mousemove", "--window",
-                   str(STATE.selected_window_id), str(rel_x), str(rel_y)]
-            if mtype == "tap":
-                cmd += ["click", "1"]
-            elif mtype == "down":
-                cmd += ["mousedown", "1"]
-            elif mtype == "up":
-                cmd += ["mouseup", "1"]
-            # mtype == "move": só o mousemove (sem ação de botão)
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=0.5)
-            except Exception:
-                # xdotool falhou (ausente, janela fechou, etc.) — rede de
-                # segurança: cai no caminho normal abaixo com pyautogui,
-                # mesmo sabendo que pode acertar a janela errada.
-                px = origin_x + rel_x
-                py = origin_y + rel_y
-                if mtype == "tap":
-                    pyautogui.click(px, py)
-                elif mtype == "move":
-                    pyautogui.moveTo(px, py, _pause=False)
-                elif mtype == "down":
-                    pyautogui.mouseDown(px, py)
-                elif mtype == "up":
-                    pyautogui.mouseUp(px, py)
-        else:
-            # Modo normal (espelhar tela inteira): pyautogui na posição
-            # absoluta. Como o vídeo mostra a tela toda, a posição já bate.
-            px = origin_x + int(x * screen_w)
-            py = origin_y + int(y * screen_h)
-            if mtype == "tap":
-                pyautogui.click(px, py)
-            elif mtype == "move":
-                pyautogui.moveTo(px, py, _pause=False)
-            elif mtype == "down":
-                pyautogui.mouseDown(px, py)
-            elif mtype == "up":
-                pyautogui.mouseUp(px, py)
+        # Modo normal (espelhar tela inteira): pyautogui na posição
+        # absoluta. Como o vídeo mostra a tela toda, a posição já bate.
+        px = origin_x + int(x * screen_w)
+        py = origin_y + int(y * screen_h)
+        if mtype == "tap":
+            pyautogui.click(px, py)
+        elif mtype == "move":
+            pyautogui.moveTo(px, py, _pause=False)
+        elif mtype == "down":
+            pyautogui.mouseDown(px, py)
+        elif mtype == "up":
+            pyautogui.mouseUp(px, py)
 
     elif mtype == "key":
         key = msg.get("key")
