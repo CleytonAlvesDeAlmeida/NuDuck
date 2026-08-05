@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NuDuck</string>
+
+    <!-- Discovery -->
+    <string name="discovery_qr_code">QR Code</string>
+    <string name="discovery_cable">Via cable (USB)</string>
+    <string name="discovery_pcs_found">PCs found:</string>
+    <string name="discovery_searching">Looking for PCs on Wi-Fi</string>
+    <string name="discovery_searching_hint">(or use adb forward to connect over USB)</string>
+    <string name="discovery_connect_button">Connect</string>
+    <string name="discovery_settings_cd">Settings</string>
+
+    <!-- PIN -->
+    <string name="pin_entry_title">Connect to %1$s</string>
+    <string name="pin_entry_subtitle">Enter the PIN shown on the PC\'s screen:</string>
+    <string name="pin_entry_label">6-digit PIN</string>
+    <string name="pin_entry_cancel">Cancel</string>
+    <string name="pin_entry_connect">Connect</string>
+    <string name="pin_entry_mode_label">Connection type</string>
+    <string name="pin_entry_mode_mirror">Mirror</string>
+    <string name="pin_entry_mode_mirror_hint">Repeats the PC screen on the phone</string>
+    <string name="pin_entry_mode_extend">Extend</string>
+    <string name="pin_entry_mode_extend_hint">Phone becomes a second screen (if the PC supports it)</string>
+
+    <!-- Connecting / error -->
+    <string name="connecting_title">Connecting…</string>
+    <string name="error_title">Couldn\'t connect</string>
+    <string name="error_dismiss">Back</string>
+    <string name="mode_fallback_notice">"Extend" isn\'t available on this PC — connected in Mirror mode instead.</string>
+    <string name="pc_via_cable">PC via cable (USB)</string>
+    <string name="usb_pc_not_found">PC not found over cable. Enable USB tethering in your phone settings and wait a few seconds.</string>
+    <string name="pc_via_qrcode">PC via QR Code</string>
+    <string name="qr_invalid">Invalid QR Code. Scan the code shown by NuDuck Server.</string>
+    <string name="pin_too_many_attempts">Too many wrong PIN attempts. Try again shortly.</string>
+    <string name="pin_incorrect">Incorrect PIN. Try again.</string>
+    <string name="signaling_closed_by_pc">Connection closed by the PC.</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_back_cd">Back</string>
+    <string name="settings_section_video">Video</string>
+    <string name="settings_quality_label">Default quality</string>
+    <string name="settings_quality_hint">Used the next time you connect to a PC</string>
+    <string name="settings_quality_auto">Automatic</string>
+    <string name="settings_section_screen_mode">Second screen</string>
+    <string name="settings_mode_label">Default connection mode</string>
+    <string name="settings_mode_hint">Can be changed per connection, on the PIN screen</string>
+    <string name="settings_section_control">Screen &amp; control</string>
+    <string name="settings_control_label">Allow touch control</string>
+    <string name="settings_control_hint">Sends taps/clicks to the PC (it must allow control too)</string>
+    <string name="settings_remember_pin_label">Remember PC PINs</string>
+    <string name="settings_remember_pin_hint">Skip retyping the PIN next time</string>
+    <string name="settings_section_appearance">Appearance</string>
+    <string name="settings_theme_label">Theme</string>
+    <string name="settings_theme_system">Automatic (system)</string>
+    <string name="settings_theme_light">Light</string>
+    <string name="settings_theme_dark">Dark</string>
+    <string name="settings_language_label">Language</string>
+    <string name="settings_section_startup">Startup</string>
+    <string name="settings_launch_on_boot_label">Launch on boot</string>
+    <string name="settings_launch_on_boot_hint">Opens NuDuck automatically once the phone finishes booting</string>
+    <string name="settings_about_text">NuDuck extends a Linux PC\'s screen to your phone over WebRTC, directly on the local network — no cloud, no account.</string>
+
+    <!-- Floating menu (while connected) -->
+    <string name="menu_open_cd">Open NuDuck menu</string>
+    <string name="menu_quality">Quality</string>
+    <string name="menu_settings">Settings</string>
+    <string name="menu_disconnect">Disconnect</string>
+    <string name="menu_back">Back</string>
+    <string name="menu_quality_selected_cd">Selected quality</string>
+    <string name="menu_mode">Mode</string>
+    <string name="menu_mode_mirror">Mirror</string>
+    <string name="menu_mode_extend">Extend</string>
+    <string name="menu_mode_mirror_desc">Repeats the PC screen</string>
+    <string name="menu_mode_extend_desc">Virtual second screen</string>
+    <string name="menu_shortcuts">Shortcuts</string>
+    <string name="menu_shortcuts_empty">No shortcuts defined on the server</string>
+    <string name="menu_shortcuts_loading">Loading shortcuts…</string>
+
+    <!-- QR Code scanning -->
+    <string name="qr_scan_hint">Point the camera at the QR Code shown on the PC</string>
+    <string name="qr_scan_permission_needed">We need camera access to read the connection QR Code.</string>
+    <string name="qr_scan_grant_permission">Allow camera access</string>
+    <string name="qr_scan_cancel">Cancel</string>
+</resources>
