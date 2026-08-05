@@ -311,7 +311,6 @@ async def local_network_only_middleware(request: web.Request, handler):
 # ==========================================================================
 
 def get_window_list() -> list:
-<<<<<<< HEAD
     """Retorna lista de janelas de aplicativos "de verdade" abertas no
     display atual.
 
@@ -406,73 +405,6 @@ def get_window_list() -> list:
 
     except Exception as exc:
         log.warning("Erro ao listar janelas via Xlib: %s", exc)
-=======
-    """Retorna lista de janelas abertas no display atual usando xdotool.
-
-    Cada item é um dict com:
-      - id: window ID (hex string)
-      - name: nome da janela (título)
-      - pid: PID do processo dono (se disponível)
-    """
-    if not shutil.which("xdotool"):
-        log.warning("xdotool não encontrado; não é possível listar janelas.")
-        return []
-
-    try:
-        result = subprocess.run(
-            ["xdotool", "search", "--onlyvisible", "--name", ""],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode != 0:
-            return []
-
-        window_ids = result.stdout.strip().splitlines()
-        windows = []
-        seen = set()
-
-        for wid_hex in window_ids:
-            wid_hex = wid_hex.strip()
-            if not wid_hex or wid_hex in seen:
-                continue
-            seen.add(wid_hex)
-
-            # Pega o nome da janela
-            try:
-                name_result = subprocess.run(
-                    ["xdotool", "getwindowname", wid_hex],
-                    capture_output=True, text=True, timeout=1,
-                )
-                name = name_result.stdout.strip() if name_result.returncode == 0 else "(sem nome)"
-            except Exception:
-                name = "(sem nome)"
-
-            # Ignora janelas sem nome útil
-            if not name or name in ("", "(sem nome)"):
-                continue
-
-            # Pega PID
-            pid = None
-            try:
-                pid_result = subprocess.run(
-                    ["xdotool", "getwindowpid", wid_hex],
-                    capture_output=True, text=True, timeout=1,
-                )
-                if pid_result.returncode == 0:
-                    pid = int(pid_result.stdout.strip())
-            except Exception:
-                pass
-
-            windows.append({
-                "id": wid_hex,
-                "name": name[:100],  # limita tamanho do nome
-                "pid": pid,
-            })
-
-        return windows
-
-    except Exception as exc:
-        log.warning("Erro ao listar janelas: %s", exc)
->>>>>>> 2f8fc2548ceac9c569241a2cc11751cd87001303
         return []
 
 
@@ -650,7 +582,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # atualizado a cada captura em _capture_and_convert().
         self._effective_source_rect = None
 
-<<<<<<< HEAD
         # Espelhar Janela: captura via extensão X Composite, que
         # continua funcionando mesmo com a janela atrás de outra (a
         # captura de tela normal só enxerga o que está fisicamente por
@@ -659,8 +590,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._composite_window_id = None
         self._composite_unavailable = False
 
-=======
->>>>>>> 2f8fc2548ceac9c569241a2cc11751cd87001303
         # Item 7: se a tela não muda por vários frames seguidos (ex.:
         # usuário parado lendo algo), aumenta gradualmente o intervalo
         # entre capturas — economiza CPU de captura/redimensionamento/
@@ -966,7 +895,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
             "png": png_b64,
         }
 
-<<<<<<< HEAD
     def _capture_window_composite(self, window_id_hex: str):
         """Espelhar Janela — captura o conteúdo de uma janela mesmo que
         ela esteja atrás de outra (ou com outra janela na frente),
@@ -1079,8 +1007,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 pass
         self._composite_window_id = None
 
-=======
->>>>>>> 2f8fc2548ceac9c569241a2cc11751cd87001303
     def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
         PROPORÇÃO (aspect ratio) da tela do celular, sem cortar nenhuma
@@ -1224,7 +1150,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
         img = np.array(raw)[:, :, :3]  # BGRA -> BGR (fica em BGR o tempo todo)
         src_h, src_w = img.shape[:2]
 
-<<<<<<< HEAD
         # --- Modo Espelhar Janela: mostra só a janela selecionada ---
         if STATE.window_mode and STATE.selected_window_id:
             # Primeiro tenta via Composite — continua funcionando mesmo
@@ -1271,37 +1196,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
         else:
             if self._composite_window_id is not None:
                 self._composite_release()
-=======
-        # --- Modo Espelhar Janela: recorta só a janela selecionada ---
-        if STATE.window_mode and STATE.selected_window_id:
-            # Atualiza cache de geometria a cada ~30 frames (~1x/s)
-            if (self._window_geo_cache is None or
-                    self._frame_count - self._window_geo_frame >= 30):
-                geo = _get_window_geometry(STATE.selected_window_id)
-                if geo is not None:
-                    self._window_geo_cache = geo
-                    self._window_geo_frame = self._frame_count
-                else:
-                    log.debug("Não conseguiu obter geometria da janela %s", STATE.selected_window_id)
-
-            if self._window_geo_cache is not None:
-                cropped, effective_rect = _crop_window_from_frame(img, self._monitor, self._window_geo_cache)
-                if cropped is not None and cropped.size > 0:
-                    img = cropped
-                    src_h, src_w = img.shape[:2]
-                    # Bug corrigido: o mouse (cursor E toque) usava
-                    # sempre a tela inteira como referência, mesmo no
-                    # modo "Espelhar Janela" — onde o vídeo mostra só
-                    # um pedaço recortado da tela. Isso fazia o cursor
-                    # e os toques caírem no lugar errado (relativo à
-                    # tela toda, não à janela). Agora guarda a área
-                    # REAL que está sendo mostrada, e _send_cursor_update
-                    # / handle_control_message usam ela como referência.
-                    self._effective_source_rect = effective_rect
-                else:
-                    self._effective_source_rect = None
-        else:
->>>>>>> 2f8fc2548ceac9c569241a2cc11751cd87001303
             self._effective_source_rect = None
 
         # Item 6 (revisado): a versão anterior recortava a região central do
@@ -1407,7 +1301,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
             except Exception:
                 pass
             self._xfixes_display = None
-<<<<<<< HEAD
         if self._composite_display is not None:
             self._composite_release()
             try:
@@ -1415,8 +1308,6 @@ class ScreenCaptureTrack(VideoStreamTrack):
             except Exception:
                 pass
             self._composite_display = None
-=======
->>>>>>> 2f8fc2548ceac9c569241a2cc11751cd87001303
         self._executor.shutdown(wait=False)
 
 
@@ -2706,11 +2597,7 @@ def start_ui(hostname: str):
             windows = get_window_list()
             if not windows:
                 window_status_label.config(
-<<<<<<< HEAD
                     text="Nenhuma janela encontrada",
-=======
-                    text="Nenhuma janela encontrada (xdotool necessário)",
->>>>>>> 2f8fc2548ceac9c569241a2cc11751cd87001303
                     fg=COLOR_WARN,
                 )
                 window_combo["values"] = []
