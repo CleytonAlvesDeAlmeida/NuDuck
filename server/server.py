@@ -1508,23 +1508,22 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
     # captura o conteúdo da janela mesmo com outra por cima (ver
     # _capture_window_composite), mas o pyautogui.click(px, py) clica na
     # posição absoluta da tela — atingindo qualquer janela que esteja
-    # visível ali, não necessariamente a compartilhada. Pra corrigir isso,
-    # ativamos (trazemos pra frente) a janela compartilhada ANTES de
-    # clicar, em eventos de "tap" e "down". Não fazemos em "move"/"up"
-    # porque seriam chamadas demais durante um arraste (lento) e porque,
-    # depois do "down", a janela já está na frente.
-    if (STATE.window_mode and STATE.selected_window_id
-            and mtype in ("tap", "down")):
-        try:
-            subprocess.run(
-                ["xdotool", "windowactivate", "--sync",
-                 str(STATE.selected_window_id)],
-                capture_output=True, timeout=0.4,
-            )
-        except Exception:
-            # windowactivate falhou (xdotool ausente, janela fechou, etc.)
-            # — não impede o clique: ainda tenta pyautogui na posição.
-            pass
+    # visível ali, não necessariamente a compartilhada.
+    #
+    # Solução SEM trazer a janela para frente: usar
+    #   xdotool mousemove --window <WID> <relx> <rely> [click|mousedown|mouseup] 1
+    # Isso move o cursor para a posição RELATIVA à janela WID (não pra frente
+    # dela — apenas posiciona o cursor visualmente dentro da janela) e em
+    # seguida envia o evento de clique. A janela compartilhada continua
+    # atrás das outras, mas o clique é entregue pra ela via xdotool.
+    #
+    # Limitações:
+    # - O cursor VISÍVEL do PC se move para a posição clicada (impossível
+    #   evitar movendo cursor + clicando via XTEST — só daria pra evitar
+    #   via XSendEvent puro, que muitos apps modernos ignoram).
+    # - Gerenciadores de janela com "focus follows mouse" podem focar a
+    #   janela (mas sem trazê-la para frente).
+    use_xdotool_window = (STATE.window_mode and STATE.selected_window_id)
 
     if mtype in ("tap", "move", "down", "up"):
         x = min(max(float(msg.get("x", 0)), 0.0), 1.0)
@@ -1542,16 +1541,48 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
         x = min(max(x, 0.0), 1.0)
         y = min(max(y, 0.0), 1.0)
 
-        px, py = origin_x + int(x * screen_w), origin_y + int(y * screen_h)
-
-        if mtype == "tap":
-            pyautogui.click(px, py)
-        elif mtype == "move":
-            pyautogui.moveTo(px, py, _pause=False)
-        elif mtype == "down":
-            pyautogui.mouseDown(px, py)
-        elif mtype == "up":
-            pyautogui.mouseUp(px, py)
+        if use_xdotool_window:
+            # Coordenadas relativas à janela (não absolutas da tela).
+            rel_x = int(x * screen_w)
+            rel_y = int(y * screen_h)
+            cmd = ["xdotool", "mousemove", "--window",
+                   str(STATE.selected_window_id), str(rel_x), str(rel_y)]
+            if mtype == "tap":
+                cmd += ["click", "1"]
+            elif mtype == "down":
+                cmd += ["mousedown", "1"]
+            elif mtype == "up":
+                cmd += ["mouseup", "1"]
+            # mtype == "move": só o mousemove (sem ação de botão)
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=0.5)
+            except Exception:
+                # xdotool falhou (ausente, janela fechou, etc.) — rede de
+                # segurança: cai no caminho normal abaixo com pyautogui,
+                # mesmo sabendo que pode acertar a janela errada.
+                px = origin_x + rel_x
+                py = origin_y + rel_y
+                if mtype == "tap":
+                    pyautogui.click(px, py)
+                elif mtype == "move":
+                    pyautogui.moveTo(px, py, _pause=False)
+                elif mtype == "down":
+                    pyautogui.mouseDown(px, py)
+                elif mtype == "up":
+                    pyautogui.mouseUp(px, py)
+        else:
+            # Modo normal (espelhar tela inteira): pyautogui na posição
+            # absoluta. Como o vídeo mostra a tela toda, a posição já bate.
+            px = origin_x + int(x * screen_w)
+            py = origin_y + int(y * screen_h)
+            if mtype == "tap":
+                pyautogui.click(px, py)
+            elif mtype == "move":
+                pyautogui.moveTo(px, py, _pause=False)
+            elif mtype == "down":
+                pyautogui.mouseDown(px, py)
+            elif mtype == "up":
+                pyautogui.mouseUp(px, py)
 
     elif mtype == "key":
         key = msg.get("key")
