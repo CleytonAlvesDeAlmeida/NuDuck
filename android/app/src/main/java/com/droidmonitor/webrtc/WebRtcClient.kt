@@ -60,6 +60,10 @@ class WebRtcClient(
     private val factory: PeerConnectionFactory
     private var peerConnection: PeerConnection? = null
     private var controlChannel: DataChannel? = null
+    
+    // FASE 3: monitoramento de frame congelado
+    private var lastFrameTimestamp: Long = 0
+    private var frozenFrameDetectionTask: Thread? = null
 
     init {
         PeerConnectionFactory.initialize(
@@ -197,6 +201,10 @@ class WebRtcClient(
                 if (track is VideoTrack) {
                     RemoteLog.i(TAG, "Track de vídeo remota recebida (onAddTrack)")
                     listener?.onRemoteVideoTrack(track)
+                    
+                    // FASE 3: iniciar monitoramento de frame congelado
+                    // Se não receber frame em 10s, dispara reconexão automática
+                    startFrozenFrameDetection()
                 }
             }
 
@@ -219,6 +227,12 @@ class WebRtcClient(
                     val bytes = ByteArray(buf.data.remaining())
                     buf.data.get(bytes)
                     val json = JSONObject(String(bytes, Charset.forName("UTF-8")))
+
+                    // FASE 1: ignorar heartbeat (keep-alive do servidor)
+                    if (json.optString("type") == "heartbeat") {
+                        RemoteLog.d(TAG, "Heartbeat recebido do servidor")
+                        return
+                    }
 
                     if (json.optString("type") != "cursor_pos") return
 
@@ -305,7 +319,42 @@ class WebRtcClient(
         channel.send(DataChannel.Buffer(java.nio.ByteBuffer.wrap(bytes), false))
     }
 
+    // FASE 3: detecção de frame congelado (vídeo parado >10s)
+    private fun startFrozenFrameDetection() {
+        lastFrameTimestamp = System.currentTimeMillis()
+        
+        // Parar task anterior se existir
+        frozenFrameDetectionTask?.interrupt()
+        
+        frozenFrameDetectionTask = Thread {
+            Thread.currentThread().name = "FrozenFrameDetector"
+            try {
+                while (!Thread.currentThread().isInterrupted) {
+                    Thread.sleep(5000) // verificar a cada 5s
+                    
+                    val now = System.currentTimeMillis()
+                    val timeSinceLastFrame = now - lastFrameTimestamp
+                    
+                    if (timeSinceLastFrame > 10000) { // 10s sem frame
+                        RemoteLog.w(TAG, "Frame congelado detectado (${timeSinceLastFrame}ms sem recebimento)")
+                        listener?.onConnectionFailed("Vídeo congelado — reconectando...")
+                        break
+                    }
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }.apply { start() }
+    }
+    
+    // Atualizar timestamp quando frame é renderizado (chamado do MainViewModel)
+    fun updateLastFrameTimestamp() {
+        lastFrameTimestamp = System.currentTimeMillis()
+    }
+
     fun close() {
+        frozenFrameDetectionTask?.interrupt()
+        frozenFrameDetectionTask = null
         controlChannel?.close()
         controlChannel = null
         peerConnection?.close()

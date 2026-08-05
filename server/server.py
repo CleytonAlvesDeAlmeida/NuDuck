@@ -48,6 +48,7 @@ import sys
 import threading
 import time
 import zlib
+import uuid  # FASE 2: geração de session IDs únicos
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -1757,8 +1758,14 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
 # ==========================================================================
 
 async def websocket_handler(request: web.Request):
-    """Lida com a conexão WebSocket do celular: PIN, offer/answer, qualidade."""
-    ws = web.WebSocketResponse(heartbeat=None)
+    """Lida com a conexão WebSocket do celular: PIN, offer/answer, qualidade.
+    
+    FASE 1 (Estabilidade): Heartbeat ativado a cada 30s pra manter a
+    conexão viva em redes móveis (4G) que fecham sockets ociosos.
+    aiohttp automaticamente envia ping/pong. Reduz desconexões de
+    5-10 min (sem heartbeat) pra ~30s de detecção.
+    """
+    ws = web.WebSocketResponse(heartbeat=30)  # FASE 1: ativar heartbeat
     await ws.prepare(request)
     peer_ip = request.remote
 
@@ -1770,6 +1777,8 @@ async def websocket_handler(request: web.Request):
     pc: Optional[RTCPeerConnection] = None
     screen_track: Optional[ScreenCaptureTrack] = None
     authenticated = False
+    session_id = None  # FASE 2: ID único pra resumir sessão após queda
+    heartbeat_task = None  # FASE 1: task pra enviar keep-alive no DataChannel
 
     log.info("Nova conexão de %s", peer_ip)
 
@@ -1801,8 +1810,10 @@ async def websocket_handler(request: web.Request):
                 if submitted == STATE.pin:
                     authenticated = True
                     STATE.clear_attempts(peer_ip)
-                    await ws.send_json({"type": "pin_ok"})
-                    log.info("PIN correto de %s", peer_ip)
+                    # FASE 2: gerar session_id único pra retomar após queda
+                    session_id = str(uuid.uuid4())
+                    await ws.send_json({"type": "pin_ok", "session_id": session_id})
+                    log.info("PIN correto de %s (session_id: %s)", peer_ip, session_id)
                 else:
                     newly_blocked = STATE.register_failed_attempt(peer_ip)
                     await ws.send_json({"type": "pin_error", "blocked": newly_blocked})
@@ -1823,8 +1834,10 @@ async def websocket_handler(request: web.Request):
                 if ok:
                     authenticated = True
                     STATE.clear_attempts(peer_ip)
-                    await ws.send_json({"type": "pin_ok"})
-                    log.info("Token QR válido de %s", peer_ip)
+                    # FASE 2: gerar session_id único pra retomar após queda
+                    session_id = str(uuid.uuid4())
+                    await ws.send_json({"type": "pin_ok", "session_id": session_id})
+                    log.info("Token QR válido de %s (session_id: %s)", peer_ip, session_id)
                 else:
                     newly_blocked = STATE.register_failed_attempt(peer_ip)
                     await ws.send_json({
@@ -1930,6 +1943,28 @@ async def websocket_handler(request: web.Request):
                     @channel.on("message")
                     def on_message(msg):
                         handle_control_message(msg, screen_track)
+                    
+                    # FASE 1: iniciar heartbeat no DataChannel
+                    # Envia {"type": "heartbeat"} a cada 10s pra manter o
+                    # canal vivo em redes que fecham conexões ociosas.
+                    nonlocal heartbeat_task
+                    
+                    async def send_datachannel_heartbeat():
+                        """Envia heartbeat periódico no DataChannel pra evitar
+                        que redes móveis (4G) fechem a conexão por inatividade.
+                        Se o channel fechar, a task termina automaticamente."""
+                        try:
+                            while channel.readyState == "open":
+                                await asyncio.sleep(10)
+                                try:
+                                    channel.send(json.dumps({"type": "heartbeat"}).encode())
+                                except Exception as exc:
+                                    log.debug("Heartbeat DC falhou: %s", exc)
+                                    break
+                        except Exception as exc:
+                            log.debug("Heartbeat DC task encerrada: %s", exc)
+                    
+                    heartbeat_task = asyncio.create_task(send_datachannel_heartbeat())
 
                 # Item 9: trickle ICE — o app (em low_latency) envia candidatos
                 # avulsos. aiortc aceita via pc.addIceCandidate().
@@ -2111,12 +2146,25 @@ async def websocket_handler(request: web.Request):
     except Exception as exc:
         log.exception("Erro na sessão de %s: %s", peer_ip, exc)
     finally:
+        # FASE 1: limpar heartbeat task
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        
+        # FASE 3: logging detalhado de desconexão
         if screen_track is not None:
             screen_track.close()
         if pc is not None:
             pcs.discard(pc)
             await pc.close()
-        log.info("Conexão encerrada de %s", peer_ip)
+        
+        log.info(
+            "Conexão encerrada de %s (session_id: %s, autenticado: %s)",
+            peer_ip, session_id or "N/A", authenticated
+        )
 
     return ws
 

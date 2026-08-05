@@ -722,8 +722,13 @@ fun RemoteVideoView(
         factory = { ctx ->
             SurfaceViewRenderer(ctx).apply {
                 val rendererEvents = object : RendererCommon.RendererEvents {
-                    override fun onFirstFrameRendered() {}
+                    override fun onFirstFrameRendered() {
+                        // FASE 3: frame renderizado, atualizar timestamp
+                        viewModel.notifyFrameReceived()
+                    }
                     override fun onFrameResolutionChanged(videoWidth: Int, videoHeight: Int, rotation: Int) {
+                        // FASE 3: frame renderizado, atualizar timestamp
+                        viewModel.notifyFrameReceived()
                         val rotated = rotation == 90 || rotation == 270
                         val size = if (rotated) IntSize(videoHeight, videoWidth) else IntSize(videoWidth, videoHeight)
                         videoSize = size

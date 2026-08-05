@@ -115,6 +115,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .readTimeout(5, TimeUnit.SECONDS)
         .build()
 
+    // FASE 2: reconexão automática com backoff exponencial
+    private var reconnectAttempt: Int = 0
+    private var reconnectTask: kotlinx.coroutines.Job? = null
+
     // ---- Estado interno para botão Voltar nativo (Item 5) ----
     // Timestamp do último toque no botão Voltar durante a transmissão.
     // 1 toque: envia ESC ao PC; 2 toques em <350ms: desconecta.
@@ -376,6 +380,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(screen = Screen.Discovery, pinError = null) }
     }
 
+    // FASE 2: wrapper para reconexão automática
+    private fun attemptConnectionTo(pc: PcInfo, pin: String, qrToken: String?) {
+        _uiState.update { it.copy(pendingQrToken = qrToken) }
+        submitPin(pc, pin)
+    }
+    
+    // FASE 2: reconexão automática com backoff exponencial (1s, 2s, 4s, 8s, 30s, 60s)
+    private fun reconnectWithBackoff() {
+        reconnectTask?.cancel()
+        reconnectTask = viewModelScope.launch(Dispatchers.Main) {
+            val maxAttempts = 6
+            while (reconnectAttempt < maxAttempts) {
+                val delayMs = when {
+                    reconnectAttempt == 0 -> 1000L
+                    reconnectAttempt < 4 -> 1000L * (1 shl reconnectAttempt) // 2^n
+                    else -> 60000L // máximo 60s
+                }
+                RemoteLog.i("MainViewModel", "Reconectando em ${delayMs}ms (tentativa ${reconnectAttempt + 1}/$maxAttempts)")
+                
+                kotlinx.coroutines.delay(delayMs)
+                reconnectAttempt++
+                
+                // Tentar reconectar (reutilizar PC + PIN atuais)
+                val currentPc = _uiState.value.connectedPc
+                val currentPin = _uiState.value.connectedPin
+                if (currentPc != null && currentPin.isNotEmpty()) {
+                    RemoteLog.i("MainViewModel", "Tentativa de reconexão #${reconnectAttempt}")
+                    attemptConnectionTo(currentPc, currentPin, _uiState.value.pendingQrToken)
+                    return@launch // sair e aguardar resultado
+                }
+            }
+            // Falha final após 6 tentativas
+            RemoteLog.e("MainViewModel", "Falha na reconexão após $maxAttempts tentativas")
+            _uiState.update { it.copy(screen = Screen.ConnectionError("Não conseguiu reconectar após $maxAttempts tentativas")) }
+        }
+    }
+    
+    // Chamada quando reconexão bem-sucedida (para resetar contador)
+    private fun resetReconnectCounter() {
+        reconnectAttempt = 0
+        reconnectTask?.cancel()
+    }
+
     fun submitPin(pc: PcInfo, pin: String) {
         val mode = _uiState.value.screenMode
         // Item 9: se conectando pelo host achado via Ancoragem USB, ativa
@@ -408,6 +455,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         connectedPin = pin,
                     )
                 }
+                // FASE 2: reconexão bem-sucedida, resetar contador
+                resetReconnectCounter()
                 // Ao conectar, busca atalhos do servidor
                 fetchShortcuts(pc.host, pc.port)
             }
@@ -417,7 +466,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             override fun onConnectionFailed(reason: String) {
-                _uiState.update { it.copy(screen = Screen.ConnectionError(reason)) }
+                // FASE 2: tentar reconectar automaticamente antes de mostrar erro
+                RemoteLog.w("MainViewModel", "Conexão falhou: $reason — tentando reconectar...")
+                this@MainViewModel.reconnectWithBackoff()
             }
 
             override fun onModeResolved(requestedMode: String, resolvedMode: String, reason: String?) {
@@ -596,6 +647,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Exposto para a UI poder inicializar o SurfaceViewRenderer com o mesmo EglBase do cliente WebRTC. */
     val activeWebRtcClient: WebRtcClient?
         get() = webRtcClient
+    
+    // FASE 3: notificar WebRtcClient que um frame foi recebido/renderizado
+    // (chamado desde a UI quando frame é desenhado — ver Immersive.kt)
+    fun notifyFrameReceived() {
+        webRtcClient?.updateLastFrameTimestamp()
+    }
 
     /** Retorna a resolução real da tela (incluindo barras do sistema). */
     fun getRealScreenSize(): Pair<Int, Int> {
