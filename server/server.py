@@ -652,6 +652,31 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
         self.set_quality(quality)
 
+    @property
+    def _window_mode_active(self) -> bool:
+        """True se o modo Espelhar Janela está ativo (janela selecionada).
+        Lido dinamicamente a cada frame porque STATE.window_mode pode
+        mudar a qualquer momento (usuário selecionou/desselecionou janela
+        na aba "Janela" da UI Tkinter, em outra thread)."""
+        return bool(STATE.window_mode and STATE.selected_window_id)
+
+    @property
+    def _effective_low_latency(self) -> bool:
+        """Estado efetivo de low_latency — combina o perfil configurado
+        (vindo do app Android via WebSocket) com o modo janela atual.
+
+        No modo Espelhar Janela, forçamos todas as otimizações de
+        low_latency (INTER_NEAREST, pula fingerprint, etc.) porque
+        priorizamos FPS/latência sobre nitidez — o usuário geralmente
+        está assistindo a uma janela dinâmica (vídeo, animação, scroll).
+
+        Note: o bitrate do codec VP8/H264 é definido na CRIAÇÃO do peer
+        (RTCRtpSender) e não pode ser mudado em runtime — então essa
+        propriedade afeta apenas o pipeline de captura/processamento,
+        não o codec. Para reduzir o bitrate também, é preciso reconectar
+        com perfil low_latency vindo do app."""
+        return self._is_low_latency or self._window_mode_active
+
     def _resolve_monitor(self, mode: str) -> tuple:
         """Decide qual tela capturar.
 
@@ -1163,8 +1188,9 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 src_h, src_w = frame_bgr.shape[:2]
                 target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-                # Item 9: em low_latency, INTER_NEAREST é mais rápido (custo de nitidez).
-                interp = cv2.INTER_NEAREST if self._is_low_latency else (
+                # Item 9: em low_latency (ou modo janela), INTER_NEAREST é
+                # mais rápido (custo de nitidez). Ver _effective_low_latency.
+                interp = cv2.INTER_NEAREST if self._effective_low_latency else (
                     cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
                 )
                 frame_resized = cv2.resize(frame_bgr, (target_w, target_h), interpolation=interp)
@@ -1277,19 +1303,13 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # aspect ratio realmente não bate com o do celular.
         target_w, target_h = self._aligned_dimensions(src_w, src_h, self._target_h)
 
-        # OTIMIZAÇÃO MODO JANELA: sempre INTER_NEAREST no modo janela.
-        # Janelas têm conteúdo dinâmico (vídeos, animações, scroll), então
-        # a nitidez extra do INTER_LINEAR quase não é percebida — mas o
-        # custo de CPU sim (~30-50% mais lento que INTER_NEAREST). No
-        # modo janela, priorizamos FPS/latência sobre nitidez.
-        in_window_mode = bool(STATE.window_mode and STATE.selected_window_id)
-        if in_window_mode:
-            interp = cv2.INTER_NEAREST
-        else:
-            # Item 9: em low_latency, sempre INTER_NEAREST (mais rápido).
-            interp = cv2.INTER_NEAREST if self._is_low_latency else (
-                cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
-            )
+        # OTIMIZAÇÃO MODO JANELA: no modo janela, _effective_low_latency
+        # já retorna True (via _window_mode_active), então INTER_NEAREST
+        # é usado automaticamente. Priorizamos FPS/latência sobre nitidez
+        # porque janelas geralmente têm conteúdo dinâmico (vídeos, scroll).
+        interp = cv2.INTER_NEAREST if self._effective_low_latency else (
+            cv2.INTER_LINEAR if target_h > 240 else cv2.INTER_NEAREST
+        )
         frame_resized = cv2.resize(img, (target_w, target_h), interpolation=interp)
 
         # Item 3: cursor não é mais desenhado aqui — ver
@@ -1309,7 +1329,7 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # e mesmo parado, o usuário geralmente está esperando algo. Pular
         # o fingerprint garante FPS máximo no modo janela, sem o overhead
         # de calcular CRC32 em cada frame.
-        if in_window_mode:
+        if self._window_mode_active:
             changed = True
         else:
             changed = self._update_frame_fingerprint(frame_resized)
@@ -1348,12 +1368,24 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # aumenta gradualmente o intervalo até a próxima captura (no
         # máximo _IDLE_MAX_MULTIPLIER vezes mais devagar). Volta ao
         # normal imediatamente assim que algo mudar de novo.
-        self._idle_streak = 0 if changed else self._idle_streak + 1
-        if self._idle_streak >= self._IDLE_THRESHOLD_FRAMES:
-            steps_past = (self._idle_streak - self._IDLE_THRESHOLD_FRAMES) // 10
-            idle_multiplier = min(self._IDLE_MAX_MULTIPLIER, 1 + steps_past)
-        else:
+        #
+        # OTIMIZAÇÃO MODO JANELA: desativa o idle_multiplier no modo
+        # janela. No modo janela, o conteúdo geralmente é dinâmico
+        # (vídeos, animações, scroll) e mesmo parado, o usuário está
+        # esperando algo acontecer. Throttling de FPS só faria o vídeo
+        # parecer "travado" quando o usuário mais precisa de fluidez.
+        # Além disso, o fingerprint já é pulado no modo janela (sempre
+        # changed=True), então _idle_streak nunca aumentaria mesmo —
+        # mas garantimos idle_multiplier=1 explicitamente pra clareza.
+        if self._window_mode_active:
             idle_multiplier = 1
+        else:
+            self._idle_streak = 0 if changed else self._idle_streak + 1
+            if self._idle_streak >= self._IDLE_THRESHOLD_FRAMES:
+                steps_past = (self._idle_streak - self._IDLE_THRESHOLD_FRAMES) // 10
+                idle_multiplier = min(self._IDLE_MAX_MULTIPLIER, 1 + steps_past)
+            else:
+                idle_multiplier = 1
         self._next_capture_time = now + self._frame_interval * idle_multiplier
 
         # Correção de CPU alta no modo Estender: mantém a thread de
