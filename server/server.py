@@ -311,71 +311,100 @@ async def local_network_only_middleware(request: web.Request, handler):
 # ==========================================================================
 
 def get_window_list() -> list:
-    """Retorna lista de janelas abertas no display atual usando xdotool.
+    """Retorna lista de janelas de aplicativos "de verdade" abertas no
+    display atual.
 
     Cada item é um dict com:
-      - id: window ID (hex string)
+      - id: window ID (string hex, ex.: "0x2200007")
       - name: nome da janela (título)
       - pid: PID do processo dono (se disponível)
+
+    Dois bugs corrigidos ao mesmo tempo (mudança de abordagem: em vez
+    de `xdotool search`, lê a lista oficial de janelas do gerenciador
+    de janelas — a MESMA lista usada pelo alt-tab/barra de tarefas):
+
+    1. "Não encontra os programas que eu uso": a versão antiga usava
+       `xdotool search --onlyvisible`, que EXCLUI qualquer janela que
+       não esteja fisicamente visível agora (minimizada, atrás de
+       outra, em outra área de trabalho) — só achava o que já estava
+       em cima. A lista nova (`_NET_CLIENT_LIST`) inclui todo programa
+       que o gerenciador de janelas conhece, minimizado ou não.
+    2. "Às vezes encontra sub-programas": a versão antiga usava
+       `xdotool search --name ""` (sem filtro nenhum), que retorna
+       QUALQUER janela X11 existente — inclusive menus, tooltips,
+       caixinhas de diálogo internas e outras janelas auxiliares sem
+       utilidade pra esse propósito. A lista nova só traz o que o
+       próprio ambiente gráfico já considera "programa" (a mesma lista
+       do alt-tab), então essas sobras somem sozinhas.
     """
-    if not shutil.which("xdotool"):
-        log.warning("xdotool não encontrado; não é possível listar janelas.")
-        return []
-
     try:
-        result = subprocess.run(
-            ["xdotool", "search", "--onlyvisible", "--name", ""],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode != 0:
-            return []
+        from Xlib import X
+        from Xlib import Xatom
+        from Xlib import display as xlib_display
 
-        window_ids = result.stdout.strip().splitlines()
-        windows = []
-        seen = set()
-
-        for wid_hex in window_ids:
-            wid_hex = wid_hex.strip()
-            if not wid_hex or wid_hex in seen:
-                continue
-            seen.add(wid_hex)
-
-            # Pega o nome da janela
-            try:
-                name_result = subprocess.run(
-                    ["xdotool", "getwindowname", wid_hex],
-                    capture_output=True, text=True, timeout=1,
+        d = xlib_display.Display()
+        try:
+            root = d.screen().root
+            net_client_list = d.intern_atom("_NET_CLIENT_LIST")
+            prop = root.get_full_property(net_client_list, X.AnyPropertyType)
+            if prop is None or not prop.value:
+                log.warning(
+                    "Não consegui ler a lista de janelas do gerenciador de janelas "
+                    "(_NET_CLIENT_LIST) — o ambiente gráfico atual pode não suportar "
+                    "esse padrão (EWMH)."
                 )
-                name = name_result.stdout.strip() if name_result.returncode == 0 else "(sem nome)"
-            except Exception:
-                name = "(sem nome)"
+                return []
 
-            # Ignora janelas sem nome útil
-            if not name or name in ("", "(sem nome)"):
-                continue
+            net_wm_name = d.intern_atom("_NET_WM_NAME")
+            utf8_string = d.intern_atom("UTF8_STRING")
+            net_wm_pid = d.intern_atom("_NET_WM_PID")
+            net_wm_state = d.intern_atom("_NET_WM_STATE")
+            skip_taskbar = d.intern_atom("_NET_WM_STATE_SKIP_TASKBAR")
 
-            # Pega PID
-            pid = None
-            try:
-                pid_result = subprocess.run(
-                    ["xdotool", "getwindowpid", wid_hex],
-                    capture_output=True, text=True, timeout=1,
-                )
-                if pid_result.returncode == 0:
-                    pid = int(pid_result.stdout.strip())
-            except Exception:
-                pass
+            windows = []
+            for wid in list(prop.value):
+                try:
+                    win = d.create_resource_object("window", wid)
 
-            windows.append({
-                "id": wid_hex,
-                "name": name[:100],  # limita tamanho do nome
-                "pid": pid,
-            })
+                    # Pula janelas que o próprio programa marcou como
+                    # "não mostrar na barra de tarefas" — às vezes
+                    # menus/paletas auxiliares ainda entram na lista
+                    # oficial, isso filtra essas sobras também.
+                    state_prop = win.get_full_property(net_wm_state, X.AnyPropertyType)
+                    if state_prop and state_prop.value and skip_taskbar in list(state_prop.value):
+                        continue
 
-        return windows
+                    name = None
+                    name_prop = win.get_full_property(net_wm_name, utf8_string)
+                    if name_prop and name_prop.value:
+                        raw = name_prop.value
+                        name = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                    if not name:
+                        name_prop = win.get_full_property(Xatom.WM_NAME, X.AnyPropertyType)
+                        if name_prop and name_prop.value:
+                            raw = name_prop.value
+                            name = raw.decode("latin-1", "replace") if isinstance(raw, bytes) else str(raw)
+                    if not name or not name.strip():
+                        continue
+
+                    pid = None
+                    pid_prop = win.get_full_property(net_wm_pid, X.AnyPropertyType)
+                    if pid_prop and pid_prop.value:
+                        try:
+                            pid = int(list(pid_prop.value)[0])
+                        except (IndexError, TypeError, ValueError):
+                            pid = None
+
+                    windows.append({"id": hex(wid), "name": name.strip()[:100], "pid": pid})
+                except Exception:
+                    continue  # a janela pode ter fechado entre a leitura da lista e agora
+
+            return windows
+        finally:
+            d.close()
 
     except Exception as exc:
-        log.warning("Erro ao listar janelas: %s", exc)
+        log.warning("Erro ao listar janelas via Xlib: %s", exc)
         return []
 
 
@@ -552,6 +581,14 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # no frame enviado (monitor inteiro, ou a janela recortada),
         # atualizado a cada captura em _capture_and_convert().
         self._effective_source_rect = None
+
+        # Espelhar Janela: captura via extensão X Composite, que
+        # continua funcionando mesmo com a janela atrás de outra (a
+        # captura de tela normal só enxerga o que está fisicamente por
+        # cima). Ver _capture_window_composite().
+        self._composite_display = None
+        self._composite_window_id = None
+        self._composite_unavailable = False
 
         # Item 7: se a tela não muda por vários frames seguidos (ex.:
         # usuário parado lendo algo), aumenta gradualmente o intervalo
@@ -858,6 +895,118 @@ class ScreenCaptureTrack(VideoStreamTrack):
             "png": png_b64,
         }
 
+    def _capture_window_composite(self, window_id_hex: str):
+        """Espelhar Janela — captura o conteúdo de uma janela mesmo que
+        ela esteja atrás de outra (ou com outra janela na frente),
+        usando a extensão X Composite (a mesma técnica que
+        compositores de janela e miniaturas de alt-tab usam).
+
+        Diferença pro método antigo: antes, o "modo janela" só recortava
+        um pedaço da captura de TELA CHEIA — então, se outra janela
+        (ou o próprio menu flutuante) tapasse a janela escolhida, o
+        recorte mostrava o que estava por cima, não o conteúdo real da
+        janela. O Composite faz o X11 desenhar a janela num "buffer"
+        separado o tempo todo, então dá pra ler o conteúdo dela sempre
+        — não importa o que está na frente.
+
+        Retorna (frame_bgr, rect_absoluto) em caso de sucesso, ou
+        (None, None) se não for possível por qualquer motivo (extensão
+        indisponível, janela fechada, formato de cor incomum, etc.) —
+        quem chama cai de volta no recorte da tela cheia nesse caso, o
+        que preserva o comportamento antigo como rede de segurança.
+        """
+        if self._composite_unavailable:
+            return None, None
+
+        try:
+            window_id = int(window_id_hex, 0)
+        except (TypeError, ValueError):
+            return None, None
+
+        try:
+            if self._composite_display is None:
+                from Xlib import display as xlib_display
+                d = xlib_display.Display()
+                if not d.has_extension("Composite"):
+                    log.info(
+                        "Extensão X Composite indisponível — o modo 'Espelhar "
+                        "Janela' vai continuar funcionando, mas só mostra a "
+                        "janela quando ela está visível na tela (não atrás de "
+                        "outras)."
+                    )
+                    self._composite_unavailable = True
+                    d.close()
+                    return None, None
+                self._composite_display = d
+
+            d = self._composite_display
+            from Xlib import X
+            from Xlib.ext import composite
+
+            window = d.create_resource_object("window", window_id)
+
+            if self._composite_window_id != window_id:
+                self._composite_release()
+                window.composite_redirect_window(composite.RedirectAutomatic)
+                self._composite_window_id = window_id
+
+            geo = window.get_geometry()
+            width, height = geo.width, geo.height
+            if width <= 0 or height <= 0:
+                return None, None
+
+            pixmap = window.composite_name_window_pixmap()
+            try:
+                reply = pixmap.get_image(0, 0, width, height, X.ZPixmap, 0xffffffff)
+            finally:
+                pixmap.free()
+
+            if reply.depth not in (24, 32):
+                # Formato de cor incomum (visual de 16 bits, etc.) — não
+                # arrisca interpretar os bytes errado, desiste pro resto
+                # desta conexão e cai no recorte de tela cheia.
+                log.info(
+                    "Profundidade de cor incomum (%s bits) — 'Espelhar Janela' "
+                    "vai usar o recorte de tela cheia em vez do Composite.",
+                    reply.depth,
+                )
+                self._composite_unavailable = True
+                return None, None
+
+            arr = np.frombuffer(reply.data, dtype=np.uint8)
+            expected = width * height * 4
+            if arr.size < expected:
+                return None, None
+            arr = arr[:expected].reshape(height, width, 4)
+            img = np.ascontiguousarray(arr[:, :, :3])  # BGR (descarta o 4º byte)
+
+            coords = d.screen().root.translate_coords(window, 0, 0)
+            rect = {"left": coords.x, "top": coords.y, "width": width, "height": height}
+            return img, rect
+
+        except Exception as exc:
+            # Não marca como "indisponível pra sempre" aqui — pode ser só
+            # a janela ter fechado ou trocado nesse instante; tenta de
+            # novo no próximo frame, com o recorte de tela cheia como
+            # rede de segurança enquanto isso.
+            log.debug("Captura via Composite falhou (%s) — usando recorte de tela cheia.", exc)
+            self._composite_window_id = None
+            return None, None
+
+    def _composite_release(self):
+        """Desfaz o redirecionamento Composite da janela anterior (se
+        houver) — chamado ao trocar de janela ou sair do modo janela,
+        pra não deixar redirecionamentos "pendurados" no X server."""
+        if self._composite_display is not None and self._composite_window_id is not None:
+            try:
+                from Xlib.ext import composite
+                window = self._composite_display.create_resource_object(
+                    "window", self._composite_window_id)
+                window.composite_unredirect_window(composite.RedirectAutomatic)
+            except Exception:
+                pass
+        self._composite_window_id = None
+
     def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
         PROPORÇÃO (aspect ratio) da tela do celular, sem cortar nenhuma
@@ -1001,35 +1150,52 @@ class ScreenCaptureTrack(VideoStreamTrack):
         img = np.array(raw)[:, :, :3]  # BGRA -> BGR (fica em BGR o tempo todo)
         src_h, src_w = img.shape[:2]
 
-        # --- Modo Espelhar Janela: recorta só a janela selecionada ---
+        # --- Modo Espelhar Janela: mostra só a janela selecionada ---
         if STATE.window_mode and STATE.selected_window_id:
-            # Atualiza cache de geometria a cada ~30 frames (~1x/s)
-            if (self._window_geo_cache is None or
-                    self._frame_count - self._window_geo_frame >= 30):
-                geo = _get_window_geometry(STATE.selected_window_id)
-                if geo is not None:
-                    self._window_geo_cache = geo
-                    self._window_geo_frame = self._frame_count
-                else:
-                    log.debug("Não conseguiu obter geometria da janela %s", STATE.selected_window_id)
+            # Primeiro tenta via Composite — continua funcionando mesmo
+            # com a janela atrás de outra (ou com o menu flutuante do
+            # celular na frente). Ver _capture_window_composite().
+            win_img, effective_rect = self._capture_window_composite(STATE.selected_window_id)
+            if win_img is not None:
+                img = win_img
+                src_h, src_w = img.shape[:2]
+                self._effective_source_rect = effective_rect
+            else:
+                # Não deu — cai no método antigo (recorte da captura de
+                # tela cheia): só mostra a janela se ela estiver
+                # fisicamente visível, mas pelo menos continua
+                # funcionando em vez de travar tudo.
+                if (self._window_geo_cache is None or
+                        self._frame_count - self._window_geo_frame >= 30):
+                    geo = _get_window_geometry(STATE.selected_window_id)
+                    if geo is not None:
+                        self._window_geo_cache = geo
+                        self._window_geo_frame = self._frame_count
+                    else:
+                        log.debug("Não conseguiu obter geometria da janela %s", STATE.selected_window_id)
 
-            if self._window_geo_cache is not None:
-                cropped, effective_rect = _crop_window_from_frame(img, self._monitor, self._window_geo_cache)
-                if cropped is not None and cropped.size > 0:
-                    img = cropped
-                    src_h, src_w = img.shape[:2]
-                    # Bug corrigido: o mouse (cursor E toque) usava
-                    # sempre a tela inteira como referência, mesmo no
-                    # modo "Espelhar Janela" — onde o vídeo mostra só
-                    # um pedaço recortado da tela. Isso fazia o cursor
-                    # e os toques caírem no lugar errado (relativo à
-                    # tela toda, não à janela). Agora guarda a área
-                    # REAL que está sendo mostrada, e _send_cursor_update
-                    # / handle_control_message usam ela como referência.
-                    self._effective_source_rect = effective_rect
+                if self._window_geo_cache is not None:
+                    cropped, crop_rect = _crop_window_from_frame(img, self._monitor, self._window_geo_cache)
+                    if cropped is not None and cropped.size > 0:
+                        img = cropped
+                        src_h, src_w = img.shape[:2]
+                        # Bug corrigido: o mouse (cursor E toque) usava
+                        # sempre a tela inteira como referência, mesmo
+                        # no modo "Espelhar Janela" — onde o vídeo
+                        # mostra só um pedaço recortado da tela. Isso
+                        # fazia o cursor e os toques caírem no lugar
+                        # errado (relativo à tela toda, não à janela).
+                        # Agora guarda a área REAL que está sendo
+                        # mostrada, e _send_cursor_update /
+                        # handle_control_message usam ela como referência.
+                        self._effective_source_rect = crop_rect
+                    else:
+                        self._effective_source_rect = None
                 else:
                     self._effective_source_rect = None
         else:
+            if self._composite_window_id is not None:
+                self._composite_release()
             self._effective_source_rect = None
 
         # Item 6 (revisado): a versão anterior recortava a região central do
@@ -1135,6 +1301,13 @@ class ScreenCaptureTrack(VideoStreamTrack):
             except Exception:
                 pass
             self._xfixes_display = None
+        if self._composite_display is not None:
+            self._composite_release()
+            try:
+                self._composite_display.close()
+            except Exception:
+                pass
+            self._composite_display = None
         self._executor.shutdown(wait=False)
 
 
@@ -2424,7 +2597,7 @@ def start_ui(hostname: str):
             windows = get_window_list()
             if not windows:
                 window_status_label.config(
-                    text="Nenhuma janela encontrada (xdotool necessário)",
+                    text="Nenhuma janela encontrada",
                     fg=COLOR_WARN,
                 )
                 window_combo["values"] = []
