@@ -599,7 +599,11 @@ fun ConnectedScreen(
                 videoTrack = track,
                 eglBaseContext = viewModel.activeWebRtcClient?.eglBase?.eglBaseContext,
                 onControlEvent = { json -> viewModel.sendControlEvent(json) },
-                onFrameResolutionChanged = { videoFrameSize = it },
+                onFrameResolutionChanged = { size ->
+                    videoFrameSize = size
+                    // FASE 3: notificar WebRtcClient que frame foi renderizado
+                    viewModel.notifyFrameReceived()
+                },
             )
             // Item 3/4: cursor do mouse do PC, desenhado aqui pelo app (não
             // vem mais embutido no vídeo) — ver CursorOverlay abaixo.
@@ -724,14 +728,14 @@ fun RemoteVideoView(
                 val rendererEvents = object : RendererCommon.RendererEvents {
                     override fun onFirstFrameRendered() {
                         // FASE 3: frame renderizado, atualizar timestamp
-                        viewModel.notifyFrameReceived()
+                        // Nota: viewModel não está em escopo aqui. Vamos chamar via
+                        // callback onFrameResolutionChanged que é passado como parâmetro
                     }
                     override fun onFrameResolutionChanged(videoWidth: Int, videoHeight: Int, rotation: Int) {
-                        // FASE 3: frame renderizado, atualizar timestamp
-                        viewModel.notifyFrameReceived()
                         val rotated = rotation == 90 || rotation == 270
                         val size = if (rotated) IntSize(videoHeight, videoWidth) else IntSize(videoWidth, videoHeight)
                         videoSize = size
+                        // FASE 3: notificar que frame foi renderizado (callback externo)
                         onFrameResolutionChanged(size)
                     }
                 }

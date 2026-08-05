@@ -230,7 +230,7 @@ class WebRtcClient(
 
                     // FASE 1: ignorar heartbeat (keep-alive do servidor)
                     if (json.optString("type") == "heartbeat") {
-                        RemoteLog.d(TAG, "Heartbeat recebido do servidor")
+                        RemoteLog.i(TAG, "Heartbeat recebido do servidor")
                         return
                     }
 
