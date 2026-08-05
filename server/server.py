@@ -2582,75 +2582,127 @@ def start_ui(hostname: str):
 
         # --- Aba: Espelhar Janela ---
         _section_label(tab_window, "Espelhar uma janela específica")
+        _hint_label(
+            tab_window,
+            "Selecione na lista abaixo a janela que deseja espelhar no "
+            "celular. A lista mostra todas as janelas abertas (a mesma "
+            "lista que aparece na barra de tarefas / Alt+Tab).",
+        ).pack(fill="x", pady=(0, 8))
 
-        window_var = tk.StringVar(value="")
-        window_combo = ttk.Combobox(
-            tab_window, textvariable=window_var,
-            state="readonly", width=40,
+        # Lista de janelas (Listbox rolável) — substitui o Combobox antigo.
+        # Mostra todas as janelas da barra de tarefas como uma lista
+        # selecionável, igual ao painel de Atalhos abaixo. Assim o usuário
+        # vê todas as janelas de uma vez e clica na que quer compartilhar.
+        window_listbox_frame = tk.Frame(tab_window, bg=BG_CARD)
+        window_listbox_frame.pack(fill="x", pady=(0, 6))
+
+        window_listbox = tk.Listbox(
+            window_listbox_frame, height=8, font=("Sans", 9),
+            bg=BG_FIELD, fg=FG_TEXT, selectbackground=ACCENT_BLUE,
+            selectforeground="#00202B", borderwidth=0, highlightthickness=0,
+            activestyle="none",
         )
-        window_combo.pack(fill="x", pady=(0, 6))
+        window_scrollbar = tk.Scrollbar(
+            window_listbox_frame, orient="vertical", command=window_listbox.yview,
+            bg="#ffffff", troughcolor="#333333", activebackground="#cccccc",
+            borderwidth=0, highlightthickness=0, width=10,
+        )
+        window_listbox.configure(yscrollcommand=window_scrollbar.set)
+        window_listbox.pack(side="left", fill="both", expand=True)
+        window_scrollbar.pack(side="right", fill="y")
 
-        window_status_label = _hint_label(tab_window, "Clique em 'Atualizar' para ver as janelas")
+        window_status_label = _hint_label(
+            tab_window, "Clique em 'Atualizar janelas' para ver as janelas abertas",
+        )
+
+        # Mapeamento: índice da Listbox -> objeto window (id, name, pid).
+        # Guardado no próprio tab_window pra sobreviver entre refreshes.
+        tab_window._window_map = {}
 
         def refresh_windows():
-            """Busca janelas abertas e atualiza o combobox."""
+            """Busca janelas abertas e atualiza a Listbox."""
             windows = get_window_list()
+            window_listbox.delete(0, tk.END)
+            tab_window._window_map = {}
             if not windows:
                 window_status_label.config(
                     text="Nenhuma janela encontrada",
                     fg=COLOR_WARN,
                 )
-                window_combo["values"] = []
-                window_var.set("")
+                # Sem janelas: desativa o modo janela (volta pra tela cheia)
                 STATE.window_mode = False
                 STATE.selected_window_id = None
                 STATE.selected_window_name = ""
                 return
 
-            names = [f"{w['name']} (PID:{w['pid'] or '?'})" for w in windows]
-            window_combo["values"] = names
+            for idx, w in enumerate(windows):
+                label = f"{w['name']} (PID:{w['pid'] or '?'})"
+                window_listbox.insert(tk.END, label)
+                tab_window._window_map[idx] = w
+
             window_status_label.config(
                 text=f"{len(windows)} janela(s) encontrada(s)",
                 fg=COLOR_OK,
             )
 
-            # Guarda mapeamento nome -> window id para uso ao selecionar
-            tab_window._window_map = {
-                f"{w['name']} (PID:{w['pid'] or '?'})": w
-                for w in windows
-            }
-
-            # Se já tinha uma janela selecionada, re-seleciona
+            # Se já tinha uma janela selecionada, re-seleciona na lista
+            # (útil quando o usuário clica em "Atualizar" pra ver se a janela
+            # continua aberta).
             if STATE.selected_window_name:
-                for n in names:
-                    if STATE.selected_window_name in n:
-                        window_var.set(n)
+                for idx, w in tab_window._window_map.items():
+                    if STATE.selected_window_name in w["name"]:
+                        window_listbox.selection_clear(0, tk.END)
+                        window_listbox.selection_set(idx)
+                        window_listbox.activate(idx)
+                        window_listbox.see(idx)
                         break
 
         def on_window_selected(event=None):
-            """Quando o usuário seleciona uma janela no combobox."""
-            sel = window_var.get()
-            wmap = getattr(tab_window, "_window_map", {})
-            win = wmap.get(sel)
-            if win:
-                STATE.window_mode = True
-                STATE.selected_window_id = win["id"]
-                STATE.selected_window_name = win["name"]
-                window_status_label.config(
-                    text=f"Janela selecionada: {win['name']}",
-                    fg=ACCENT_BLUE,
-                )
-                log.info("Janela selecionada: %s (ID: %s)", win["name"], win["id"])
-            else:
-                STATE.window_mode = False
-                STATE.selected_window_id = None
-                STATE.selected_window_name = ""
+            """Quando o usuário seleciona uma janela na Listbox."""
+            sel = window_listbox.curselection()
+            if not sel:
+                return
+            w = tab_window._window_map.get(sel[0])
+            if not w:
+                return
+            STATE.window_mode = True
+            STATE.selected_window_id = w["id"]
+            STATE.selected_window_name = w["name"]
+            window_status_label.config(
+                text=f"Janela selecionada: {w['name']}",
+                fg=ACCENT_BLUE,
+            )
+            log.info("Janela selecionada: %s (ID: %s)", w["name"], w["id"])
 
-        window_combo.bind("<<ComboboxSelected>>", on_window_selected)
+        def back_to_fullscreen():
+            """Volta a compartilhar a tela inteira — sai do modo Espelhar
+            Janela. Limpa a seleção da lista, desativa STATE.window_mode e
+            solta o redirecionamento Composite na próxima captura."""
+            STATE.window_mode = False
+            STATE.selected_window_id = None
+            STATE.selected_window_name = ""
+            window_listbox.selection_clear(0, tk.END)
+            window_status_label.config(
+                text="Compartilhando a tela inteira",
+                fg=COLOR_OK,
+            )
+            log.info("Voltando a compartilhar a tela inteira")
 
-        _flat_button(tab_window, "Atualizar janelas", refresh_windows).pack(pady=(6, 0))
+        window_listbox.bind("<<ListboxSelect>>", on_window_selected)
 
-        tab_window._window_map = {}
+        # Botões: "Atualizar janelas" (recarrega a lista) e "Voltar a
+        # tela cheia" (desfaz a seleção e volta a compartilhar a tela
+        # inteira normalmente).
+        window_buttons_row = tk.Frame(tab_window, bg=BG_CARD)
+        window_buttons_row.pack(fill="x", pady=(6, 0))
+
+        _flat_button(
+            window_buttons_row, "Atualizar janelas", refresh_windows,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        _flat_button(
+            window_buttons_row, "Voltar a tela cheia", back_to_fullscreen, accent=True,
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         # --- Aba: Atalhos (comandos que abrem programas na 2ª tela) ---
         _section_label(tab_shortcuts, "Atalhos do Display Virtual")
