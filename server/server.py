@@ -56,10 +56,24 @@ import numpy as np
 import pyautogui
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc import RTCRtpSender
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 from zeroconf import ServiceInfo, Zeroconf
 import cv2
+
+# XShm (MIT-SHM) — captura de janelas via memória compartilhada. Reduz o
+# atraso do modo espelhar janela em ~5ms/frame (janelas 1080p+). Módulo
+# separado porque a implementação manual dos requests MIT-SHM é longa.
+# Import "lazy" (dentro do try) porque o módulo depende de python-xlib
+# e libc — se algum falhar, o modo janela cai no fallback get_image.
+try:
+    from xshm_capture import XShmCapturer
+    _XSHM_AVAILABLE = True
+except Exception as _xshm_import_exc:
+    XShmCapturer = None
+    _XSHM_AVAILABLE = False
+    log_xshm_msg = f"XShm indisponível ({_xshm_import_exc}) — modo janela vai usar get_image normal"
 
 # Correção de performance (consumo de CPU durante a transmissão):
 # por padrão o OpenCV cria sozinho um pool de threads usando TODOS os
@@ -203,6 +217,10 @@ PIN_LENGTH = 6
 pyautogui.FAILSAFE = False
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(APP_NAME)
+
+# Loga se XShm não pôde ser importado ( mensagem definida no try acima).
+if not _XSHM_AVAILABLE:
+    log.info("%s", log_xshm_msg)
 
 # Buffer de logs em memória pra janela "Ver terminal"
 LOG_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=5000)
@@ -601,6 +619,11 @@ class ScreenCaptureTrack(VideoStreamTrack):
         # Cache do objeto window Xlib — evita create_resource_object
         # por frame (small overhead, mas conta no total de round-trips).
         self._composite_window_obj = None
+        # XShm capturer — criado sob demanda quando o primeiro frame do
+        # modo janela for capturado. Não cria antes pra não abrir conexão
+        # X extra se o modo janela nunca for usado.
+        self._xshm_capturer = None
+        self._xshm_unavailable = False
 
         # Item 7: se a tela não muda por vários frames seguidos (ex.:
         # usuário parado lendo algo), aumenta gradualmente o intervalo
@@ -1029,28 +1052,63 @@ class ScreenCaptureTrack(VideoStreamTrack):
 
             pixmap = window.composite_name_window_pixmap()
             try:
-                reply = pixmap.get_image(0, 0, width, height, X.ZPixmap, 0xffffffff)
+                # Caminho rápido: MIT-SHM (memória compartilhada). Os pixels
+                # são escritos pelo X server DIRETO num segmento shm — não
+                # atravessam o socket X11. Economiza ~5ms/frame em janelas
+                # 1080p+. Ver xshm_capture.py para detalhes.
+                pixmap_id = int(pixmap.id) if hasattr(pixmap, "id") else None
+
+                img = None
+                if (pixmap_id is not None and _XSHM_AVAILABLE
+                        and not self._xshm_unavailable):
+                    if self._xshm_capturer is None:
+                        try:
+                            self._xshm_capturer = XShmCapturer(d)
+                            if not self._xshm_capturer.available:
+                                self._xshm_unavailable = True
+                                self._xshm_capturer = None
+                        except Exception as exc:
+                            log.debug("XShmCapturer init falhou: %s", exc)
+                            self._xshm_unavailable = True
+                            self._xshm_capturer = None
+
+                    if self._xshm_capturer is not None:
+                        try:
+                            img = self._xshm_capturer.capture(pixmap_id, width, height)
+                        except Exception as exc:
+                            log.debug("XShm capture falhou (%s) — usando get_image.", exc)
+                            img = None
+
+                # Caminho fallback: get_image normal (copia pelo socket X11).
+                # Usado se XShm não estiver disponível OU falhou neste frame.
+                if img is None:
+                    reply = pixmap.get_image(0, 0, width, height, X.ZPixmap, 0xffffffff)
+
+                    if reply.depth not in (24, 32):
+                        # Formato de cor incomum (visual de 16 bits, etc.) —
+                        # não arrisca interpretar os bytes errado, desiste
+                        # pro resto desta conexão e cai no recorte de tela
+                        # cheia.
+                        log.info(
+                            "Profundidade de cor incomum (%s bits) — 'Espelhar "
+                            "Janela' vai usar o recorte de tela cheia em vez do "
+                            "Composite.",
+                            reply.depth,
+                        )
+                        self._composite_unavailable = True
+                        return None, None
+
+                    arr = np.frombuffer(reply.data, dtype=np.uint8)
+                    expected = width * height * 4
+                    if arr.size < expected:
+                        return None, None
+                    arr = arr[:expected].reshape(height, width, 4)
+                    img = np.ascontiguousarray(arr[:, :, :3])  # BGR (descarta o 4º byte)
             finally:
                 pixmap.free()
 
-            if reply.depth not in (24, 32):
-                # Formato de cor incomum (visual de 16 bits, etc.) — não
-                # arrisca interpretar os bytes errado, desiste pro resto
-                # desta conexão e cai no recorte de tela cheia.
-                log.info(
-                    "Profundidade de cor incomum (%s bits) — 'Espelhar Janela' "
-                    "vai usar o recorte de tela cheia em vez do Composite.",
-                    reply.depth,
-                )
-                self._composite_unavailable = True
+            if img is None:
                 return None, None
-
-            arr = np.frombuffer(reply.data, dtype=np.uint8)
-            expected = width * height * 4
-            if arr.size < expected:
-                return None, None
-            arr = arr[:expected].reshape(height, width, 4)
-            img = np.ascontiguousarray(arr[:, :, :3])  # BGR (descarta o 4º byte)
 
             rect = {
                 "left": cache["left"], "top": cache["top"],
@@ -1085,6 +1143,16 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._composite_geo_cache = None
         self._composite_geo_frame = 0
         self._composite_window_obj = None
+        # Libera o segmento shm — ao trocar de janela, o tamanho pode
+        # mudar e o segmento antigo não serve mais. Não marca como
+        # "indisponível" porque o XShm em si ainda funciona; só precisa
+        # recriar o segmento na próxima captura.
+        if self._xshm_capturer is not None:
+            try:
+                self._xshm_capturer.close()
+            except Exception:
+                pass
+            self._xshm_capturer = None
 
     def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
@@ -1766,6 +1834,28 @@ async def websocket_handler(request: web.Request):
                 )
                 pc.addTrack(relay.subscribe(screen_track))
                 screen_track.start_cursor_loop()
+
+                # Forçar VP8: VP8 tem latência de codificação menor que
+                # H264 no aiortc (sem B-frames, sem loop de deblockfilter).
+                # Em low_latency ou modo janela, é essencial para reduzir
+                # o atraso total de captura→codificação→envio.
+                # Mesmo VP8 já sendo default no aiortc, forçamos explicitamente
+                # porque alguns peers Android oferecem H264 primeiro na SDP,
+                # e sem isso o aiortc pode acabar usando H264.
+                try:
+                    capabilities = RTCRtpSender.getCapabilities("video")
+                    if capabilities and capabilities.codecs:
+                        vp8_codecs = [
+                            c for c in capabilities.codecs
+                            if c.mimeType == "video/VP8"
+                        ]
+                        if vp8_codecs:
+                            transceivers = pc.getTransceivers()
+                            if transceivers:
+                                transceivers[0].setCodecPreferences(vp8_codecs)
+                                log.debug("Codec VP8 forçado para o transceiver de vídeo")
+                except Exception as exc:
+                    log.debug("Não foi possível forçar VP8: %s", exc)
 
                 # Item 9: aplica bitrate máximo no RTPSender do vídeo, se
                 # suportado pelo aiortc. Em low_latency, limita a 2.5 Mbps.
