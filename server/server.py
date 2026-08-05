@@ -462,6 +462,49 @@ def _get_window_geometry(window_id_hex: str):
         return None
 
 
+def capture_window_thumbnail(window_id_hex: str, max_w: int = 150, max_h: int = 100):
+    """Tira uma miniatura (imagem pequena) do conteúdo ATUAL de uma
+    janela, pra mostrar na barra de tarefas visual da aba "Janela" do
+    Tkinter (pedido do usuário: em vez de só o nome da janela, mostrar
+    uma prévia visual — igual passar o mouse em cima de um ícone na
+    barra de tarefas do Windows/Linux).
+
+    Como funciona: pega a posição/tamanho da janela (mesma função usada
+    pelo modo Espelhar Janela) e recorta essa região de um screenshot
+    da tela cheia (mss), depois reduz pra um tamanho pequeno.
+
+    Limitação conhecida: como é um recorte da tela, só funciona bem se
+    a janela estiver visível (não minimizada, não 100% coberta por
+    outra). Isso é aceitável aqui porque é só uma prévia estática pra
+    ajudar a reconhecer a janela na lista — não é o vídeo transmitido
+    de verdade (esse sim funciona com a janela escondida, via X
+    Composite em _capture_window_composite).
+
+    Retorna um PIL.Image (modo RGB, já reduzido) ou None se não for
+    possível (janela fechada/minimizada/fora da tela, ou qualquer
+    outro erro de captura).
+    """
+    geo = _get_window_geometry(window_id_hex)
+    if not geo:
+        return None
+
+    try:
+        from PIL import Image
+
+        with mss.mss() as sct:
+            monitor = {
+                "left": geo["x"], "top": geo["y"],
+                "width": geo["width"], "height": geo["height"],
+            }
+            raw = sct.grab(monitor)
+        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        img.thumbnail((max_w, max_h), Image.LANCZOS)
+        return img
+    except Exception as exc:
+        log.debug("Não consegui gerar miniatura da janela %s (%s)", window_id_hex, exc)
+        return None
+
+
 def _crop_window_from_frame(frame_bgr, monitor, geo):
     """Recorta a região de uma janela de um frame BGR da tela cheia.
 
@@ -2818,46 +2861,81 @@ def start_ui(hostname: str):
         _section_label(tab_window, "Espelhar uma janela específica")
         _hint_label(
             tab_window,
-            "Selecione na lista abaixo a janela que deseja espelhar no "
-            "celular. A lista mostra todas as janelas abertas (a mesma "
-            "lista que aparece na barra de tarefas / Alt+Tab).",
+            "Clique na miniatura da janela que deseja espelhar no celular "
+            "— igual escolher numa barra de tarefas de verdade. A lista "
+            "mostra todas as janelas abertas (a mesma lista que aparece "
+            "na barra de tarefas / Alt+Tab).",
         ).pack(fill="x", pady=(0, 8))
 
-        # Lista de janelas (Listbox rolável) — substitui o Combobox antigo.
-        # Mostra todas as janelas da barra de tarefas como uma lista
-        # selecionável, igual ao painel de Atalhos abaixo. Assim o usuário
-        # vê todas as janelas de uma vez e clica na que quer compartilhar.
-        window_listbox_frame = tk.Frame(tab_window, bg=BG_CARD)
-        window_listbox_frame.pack(fill="x", pady=(0, 6))
-
-        window_listbox = tk.Listbox(
-            window_listbox_frame, height=8, font=("Sans", 9),
-            bg=BG_FIELD, fg=FG_TEXT, selectbackground=ACCENT_BLUE,
-            selectforeground="#00202B", borderwidth=0, highlightthickness=0,
-            activestyle="none",
-        )
-        window_scrollbar = tk.Scrollbar(
-            window_listbox_frame, orient="vertical", command=window_listbox.yview,
-            bg="#ffffff", troughcolor="#333333", activebackground="#cccccc",
-            borderwidth=0, highlightthickness=0, width=10,
-        )
-        window_listbox.configure(yscrollcommand=window_scrollbar.set)
-        window_listbox.pack(side="left", fill="both", expand=True)
-        window_scrollbar.pack(side="right", fill="y")
+        # Barra de tarefas visual: grade de "cartões" com miniatura da
+        # janela + nome embaixo, em vez da lista de texto antiga.
+        # windows_grid fica dentro de tab_window, que já rola sozinho
+        # (ver _make_scrollable_tab acima) — não precisa de scrollbar
+        # própria aqui.
+        windows_grid = tk.Frame(tab_window, bg=BG_CARD)
+        windows_grid.pack(fill="x", pady=(0, 6))
 
         window_status_label = _hint_label(
             tab_window, "Clique em 'Atualizar janelas' para ver as janelas abertas",
         )
 
-        # Mapeamento: índice da Listbox -> objeto window (id, name, pid).
-        # Guardado no próprio tab_window pra sobreviver entre refreshes.
-        tab_window._window_map = {}
+        THUMB_W, THUMB_H = 150, 100
+        THUMB_COLUMNS = 3
+
+        # Mapeamento idx -> dados; guardado no tab_window pra sobreviver
+        # entre refreshes e ser acessível pelos callbacks de clique.
+        tab_window._window_map = {}       # idx -> {id, name, pid}
+        tab_window._window_cards = {}     # idx -> (card_frame, name_label)
+        tab_window._thumb_images = {}     # idx -> PhotoImage (mantém viva, senão o Tk descarta)
+
+        def _highlight_selected_card():
+            """Realça visualmente (borda azul) o cartão da janela
+            atualmente selecionada, e tira o realce dos outros."""
+            for idx, (card, name_label) in tab_window._window_cards.items():
+                w = tab_window._window_map.get(idx)
+                is_selected = bool(
+                    w and STATE.window_mode and STATE.selected_window_id == w["id"]
+                )
+                card_bg = ACCENT_BLUE if is_selected else BG_FIELD
+                card.configure(
+                    highlightbackground=ACCENT_BLUE if is_selected else BG_FIELD,
+                    highlightcolor=ACCENT_BLUE if is_selected else BG_FIELD,
+                    bg=card_bg,
+                )
+                name_label.configure(
+                    bg=card_bg,
+                    fg=("#00202B" if is_selected else FG_TEXT),
+                )
+
+        def select_window_by_index(idx):
+            """Chamado quando o usuário clica numa miniatura da barra de
+            tarefas visual."""
+            w = tab_window._window_map.get(idx)
+            if not w:
+                return
+            STATE.window_mode = True
+            STATE.selected_window_id = w["id"]
+            STATE.selected_window_name = w["name"]
+            window_status_label.config(
+                text=f"Janela selecionada: {w['name']}",
+                fg=ACCENT_BLUE,
+            )
+            log.info("Janela selecionada: %s (ID: %s)", w["name"], w["id"])
+            _highlight_selected_card()
 
         def refresh_windows():
-            """Busca janelas abertas e atualiza a Listbox."""
+            """Busca janelas abertas, tira uma miniatura de cada uma e
+            reconstrói a barra de tarefas visual (grade de cartões)."""
+            from PIL import Image, ImageTk
+
             windows = get_window_list()
-            window_listbox.delete(0, tk.END)
+
+            for child in windows_grid.winfo_children():
+                child.destroy()
             tab_window._window_map = {}
+            tab_window._window_cards = {}
+            tab_window._thumb_images = {}
+
             if not windows:
                 window_status_label.config(
                     text="Nenhuma janela encontrada",
@@ -2870,59 +2948,75 @@ def start_ui(hostname: str):
                 return
 
             for idx, w in enumerate(windows):
-                label = f"{w['name']} (PID:{w['pid'] or '?'})"
-                window_listbox.insert(tk.END, label)
                 tab_window._window_map[idx] = w
 
+                # Miniatura real da janela; se não der (minimizada, fora
+                # da tela, fechou entre a listagem e a captura), usa um
+                # retângulo cinza simples no lugar — a janela continua
+                # selecionável normalmente, só sem prévia visual.
+                thumb = capture_window_thumbnail(w["id"], THUMB_W, THUMB_H)
+                canvas_img = Image.new("RGB", (THUMB_W, THUMB_H), "#1a1f2e")
+                if thumb is not None:
+                    off_x = (THUMB_W - thumb.width) // 2
+                    off_y = (THUMB_H - thumb.height) // 2
+                    canvas_img.paste(thumb, (off_x, off_y))
+
+                photo = ImageTk.PhotoImage(canvas_img)
+                tab_window._thumb_images[idx] = photo  # mantém referência viva
+
+                row, col = divmod(idx, THUMB_COLUMNS)
+
+                card = tk.Frame(
+                    windows_grid, bg=BG_FIELD, bd=0,
+                    highlightthickness=2, highlightbackground=BG_FIELD,
+                    highlightcolor=BG_FIELD, cursor="hand2",
+                )
+                card.grid(row=row, column=col, padx=6, pady=6, sticky="n")
+
+                thumb_label = tk.Label(
+                    card, image=photo, bg="#1a1f2e", bd=0, cursor="hand2",
+                )
+                thumb_label.pack(padx=4, pady=(4, 2))
+
+                name_short = w["name"] if len(w["name"]) <= 22 else w["name"][:21] + "…"
+                name_label = tk.Label(
+                    card, text=name_short, font=("Sans", 8),
+                    bg=BG_FIELD, fg=FG_TEXT, cursor="hand2",
+                    wraplength=THUMB_W,
+                )
+                name_label.pack(padx=4, pady=(0, 4))
+
+                tab_window._window_cards[idx] = (card, name_label)
+
+                def _make_click_handler(index):
+                    return lambda _event=None: select_window_by_index(index)
+
+                click_handler = _make_click_handler(idx)
+                card.bind("<Button-1>", click_handler)
+                thumb_label.bind("<Button-1>", click_handler)
+                name_label.bind("<Button-1>", click_handler)
+
             window_status_label.config(
-                text=f"{len(windows)} janela(s) encontrada(s)",
+                text=f"{len(windows)} janela(s) encontrada(s) — clique numa miniatura pra selecionar",
                 fg=COLOR_OK,
             )
 
-            # Se já tinha uma janela selecionada, re-seleciona na lista
-            # (útil quando o usuário clica em "Atualizar" pra ver se a janela
-            # continua aberta).
-            if STATE.selected_window_name:
-                for idx, w in tab_window._window_map.items():
-                    if STATE.selected_window_name in w["name"]:
-                        window_listbox.selection_clear(0, tk.END)
-                        window_listbox.selection_set(idx)
-                        window_listbox.activate(idx)
-                        window_listbox.see(idx)
-                        break
-
-        def on_window_selected(event=None):
-            """Quando o usuário seleciona uma janela na Listbox."""
-            sel = window_listbox.curselection()
-            if not sel:
-                return
-            w = tab_window._window_map.get(sel[0])
-            if not w:
-                return
-            STATE.window_mode = True
-            STATE.selected_window_id = w["id"]
-            STATE.selected_window_name = w["name"]
-            window_status_label.config(
-                text=f"Janela selecionada: {w['name']}",
-                fg=ACCENT_BLUE,
-            )
-            log.info("Janela selecionada: %s (ID: %s)", w["name"], w["id"])
+            _highlight_selected_card()
 
         def back_to_fullscreen():
             """Volta a compartilhar a tela inteira — sai do modo Espelhar
-            Janela. Limpa a seleção da lista, desativa STATE.window_mode e
-            solta o redirecionamento Composite na próxima captura."""
+            Janela. Tira o realce de qualquer cartão selecionado, desativa
+            STATE.window_mode e solta o redirecionamento Composite na
+            próxima captura."""
             STATE.window_mode = False
             STATE.selected_window_id = None
             STATE.selected_window_name = ""
-            window_listbox.selection_clear(0, tk.END)
+            _highlight_selected_card()
             window_status_label.config(
                 text="Compartilhando a tela inteira",
                 fg=COLOR_OK,
             )
             log.info("Voltando a compartilhar a tela inteira")
-
-        window_listbox.bind("<<ListboxSelect>>", on_window_selected)
 
         # Botões: "Atualizar janelas" (recarrega a lista) e "Voltar a
         # tela cheia" (desfaz a seleção e volta a compartilhar a tela
