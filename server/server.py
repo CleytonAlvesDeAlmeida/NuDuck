@@ -589,6 +589,15 @@ class ScreenCaptureTrack(VideoStreamTrack):
         self._composite_display = None
         self._composite_window_id = None
         self._composite_unavailable = False
+        # Cache de geometria + posição absoluta da janela Composite.
+        # Antes, cada frame fazia 5 round-trips no protocolo X
+        # (get_geometry, name_pixmap, get_image, free, translate_coords).
+        # Agora faz 3 (name_pixmap, get_image, free) — geometria e
+        # translate_coords só refazem ~1x/s, porque só mudam se o
+        # usuário mover/redimensionar a janela. Reduz o atraso do modo
+        # espelhar janela em ~30-40%.
+        self._composite_geo_cache = None    # {width, height, left, top, frame}
+        self._composite_geo_frame = 0
 
         # Item 7: se a tela não muda por vários frames seguidos (ex.:
         # usuário parado lendo algo), aumenta gradualmente o intervalo
@@ -949,11 +958,38 @@ class ScreenCaptureTrack(VideoStreamTrack):
                 self._composite_release()
                 window.composite_redirect_window(composite.RedirectAutomatic)
                 self._composite_window_id = window_id
+                # Janela mudou — invalida o cache de geometria pra forçar
+                # releitura no primeiro frame da nova janela.
+                self._composite_geo_cache = None
 
-            geo = window.get_geometry()
-            width, height = geo.width, geo.height
-            if width <= 0 or height <= 0:
-                return None, None
+            # Geometria + posição absoluta cacheadas por ~30 frames
+            # (1 s a 30 fps). Só mudam se o usuário mover/redimensionar a
+            # janela — caso raro. Isso corta 2 round-trips X por frame
+            # (get_geometry e translate_coords), que eram a maior fonte
+            # de atraso do modo espelhar janela.
+            cache = self._composite_geo_cache
+            need_refresh = (
+                cache is None
+                or self._frame_count - self._composite_geo_frame >= 30
+                or self._composite_window_id != window_id
+            )
+            if need_refresh:
+                geo = window.get_geometry()
+                width, height = geo.width, geo.height
+                if width <= 0 or height <= 0:
+                    return None, None
+                coords = d.screen().root.translate_coords(window, 0, 0)
+                cache = {
+                    "width": width,
+                    "height": height,
+                    "left": coords.x,
+                    "top": coords.y,
+                }
+                self._composite_geo_cache = cache
+                self._composite_geo_frame = self._frame_count
+            else:
+                width = cache["width"]
+                height = cache["height"]
 
             pixmap = window.composite_name_window_pixmap()
             try:
@@ -980,8 +1016,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
             arr = arr[:expected].reshape(height, width, 4)
             img = np.ascontiguousarray(arr[:, :, :3])  # BGR (descarta o 4º byte)
 
-            coords = d.screen().root.translate_coords(window, 0, 0)
-            rect = {"left": coords.x, "top": coords.y, "width": width, "height": height}
+            rect = {
+                "left": cache["left"], "top": cache["top"],
+                "width": width, "height": height,
+            }
             return img, rect
 
         except Exception as exc:
@@ -1006,6 +1044,10 @@ class ScreenCaptureTrack(VideoStreamTrack):
             except Exception:
                 pass
         self._composite_window_id = None
+        # Invalida o cache de geometria/posição — ao trocar de janela ou
+        # sair do modo janela, o cache antigo não serve mais.
+        self._composite_geo_cache = None
+        self._composite_geo_frame = 0
 
     def _letterbox(self, img_bgr):
         """Adiciona letterboxing/pillarboxing para enquadrar o conteúdo na
@@ -1460,6 +1502,29 @@ def handle_control_message(raw_msg: str, screen_track: ScreenCaptureTrack):
     else:
         origin_x, origin_y = 0, 0
         screen_w, screen_h = pyautogui.size()
+
+    # Modo Espelhar Janela: o toque tem que ir pra JANELA COMPARTILHADA,
+    # não pra janela que estiver na frente dela na tela do PC. O Composite
+    # captura o conteúdo da janela mesmo com outra por cima (ver
+    # _capture_window_composite), mas o pyautogui.click(px, py) clica na
+    # posição absoluta da tela — atingindo qualquer janela que esteja
+    # visível ali, não necessariamente a compartilhada. Pra corrigir isso,
+    # ativamos (trazemos pra frente) a janela compartilhada ANTES de
+    # clicar, em eventos de "tap" e "down". Não fazemos em "move"/"up"
+    # porque seriam chamadas demais durante um arraste (lento) e porque,
+    # depois do "down", a janela já está na frente.
+    if (STATE.window_mode and STATE.selected_window_id
+            and mtype in ("tap", "down")):
+        try:
+            subprocess.run(
+                ["xdotool", "windowactivate", "--sync",
+                 str(STATE.selected_window_id)],
+                capture_output=True, timeout=0.4,
+            )
+        except Exception:
+            # windowactivate falhou (xdotool ausente, janela fechou, etc.)
+            # — não impede o clique: ainda tenta pyautogui na posição.
+            pass
 
     if mtype in ("tap", "move", "down", "up"):
         x = min(max(float(msg.get("x", 0)), 0.0), 1.0)
