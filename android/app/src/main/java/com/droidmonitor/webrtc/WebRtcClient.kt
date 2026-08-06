@@ -135,8 +135,14 @@ class WebRtcClient(
                 // Item 9: Trickle ICE em low_latency — envia cada candidato
                 // assim que disponível, em vez de esperar GATHER_COMPLETE.
                 // Reduz o tempo até o primeiro frame em ~1s em LAN.
-                if (isLowLatency && candidate != null) {
-                    signalingClient.sendIceCandidate(candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex)
+                // BUG USB FIX: log detalhado de candidatos ICE para debug
+                if (candidate != null) {
+                    RemoteLog.i(TAG, "ICE Candidate: ${candidate.sdp.take(80)}")
+                    if (isLowLatency) {
+                        signalingClient.sendIceCandidate(candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex)
+                    }
+                } else {
+                    RemoteLog.i(TAG, "ICE Candidate: null (fim do gathering)")
                 }
             }
 

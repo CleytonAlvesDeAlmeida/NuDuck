@@ -1919,6 +1919,13 @@ async def websocket_handler(request: web.Request):
                 profile = data.get("profile", "standard")
                 if profile not in ("standard", "low_latency"):
                     profile = "standard"
+                
+                # BUG USB FIX: log detalhado de profile recebido
+                if profile == "low_latency":
+                    log.info("✓ Perfil LOW_LATENCY recebido (USB Tethering detectado no celular)")
+                else:
+                    log.info("ℹ Perfil STANDARD (Wi-Fi ou outro)")
+                
                 max_bitrate = int(data.get("maxBitrate", 0) or 0)
                 max_fps = int(data.get("maxFps", 0) or 0)
 

@@ -12,12 +12,34 @@ import java.util.concurrent.atomic.AtomicInteger
 
 private const val TAG = "UsbConnectionMonitor"
 private const val SERVER_PORT = 8765
-private const val POLL_INTERVAL_MS = 1500L
+// BUG FIX USB: reduzir polling de 1500ms → 500ms
+// Motivo: Tablet sem WiFi/BT precisa reconhecer USB rápido (depuração USB é lento)
+private const val POLL_INTERVAL_MS = 500L
+// BUG FIX USB: aumentar timeout de 200ms para 1500ms
+// Motivo: USB tethering inicial pode ser MUI lento, especialmente em tablets
+// Com depuração USB, precisamos ser pacientes na primeira tentativa
+private const val CONNECT_TIMEOUT_MS = 1500
 
-// Nomes típicos de interface de Ancoragem USB no Android — varia por
-// fabricante/versão/kernel: rndis0 (o mais comum, USB RNDIS), usb0,
-// ncm0 (USB NCM, mais recente), às vezes prefixados com "r_".
-private val TETHER_INTERFACE_REGEX = Regex("(?i)^(r_)?(rndis|usb|ncm)\\d*$")
+// BUG FIX USB: Regex MUITO mais permissiva
+// Nomes de interface variam insanamente entre fabricantes:
+// - rndis0 (USB RNDIS, o mais comum)
+// - usb0, usb1, etc (USB genérico)
+// - ncm0, ncm-wwan0 (Qualcomm USB NCM)
+// - eth0, eth1 (alguns tablets antigos)
+// - usbnet0, usbnet1 (alguns Samsung)
+// - neth0, neth1 (alguns Huawei)
+// - bridge0, br0 (USB bridge mode)
+// - ppp0, ppp1, wwan0 (alguns modems USB antigos)
+// - tether0, tether1 (nome genérico)
+// - ip0, ip1 (alguns 5G modems)
+// Com prefixos opcionais "r_", "rev_", etc
+// Ser permissivo é melhor do que perder uma interface legítima
+private val TETHER_INTERFACE_REGEX = Regex(
+    "(?i)^(r_|rev_)?" +  // prefixo opcional
+    "(rndis|usb|ncm|neth|usbnet|eth|pan|bridge|ppp|wwan|br|tether|ip)" +  // nomes base
+    "\\d*" +  // número da interface
+    "(-wwan|-data)?$"  // sufixos opcionais
+)
 
 /**
  * Monitora a **Ancoragem USB** (USB tethering) entre o celular e o PC.
@@ -63,6 +85,7 @@ class UsbConnectionMonitor(private val context: Context) {
 
     private val scanExecutor = Executors.newFixedThreadPool(24)
     private val scanGeneration = AtomicInteger(0)
+    private val adbReverseClient = AdbReverseClient()  // BUG FIX USB: ADB reverse fallback
 
     @Volatile private var discoveredHost: String? = null
     @Volatile private var lastReported = false
@@ -77,24 +100,40 @@ class UsbConnectionMonitor(private val context: Context) {
         running = true
         pollThread = Thread({
             var wasTethering = false
+            var adbReverseTried = false  // BUG FIX USB: evitar loop infinito de ADB
+            
             while (running) {
                 try {
                     val iface = findTetherInterface()
                     if (iface != null) {
                         val (netIface, addr) = iface
                         if (!wasTethering) {
-                            RemoteLog.i(TAG, "Interface de Ancoragem USB detectada: ${netIface.name} ($addr)")
+                            RemoteLog.i(TAG, "✓ Interface Ancoragem USB detectada: ${netIface.name} (${addr.hostAddress})")
                             wasTethering = true
+                            adbReverseTried = false  // resetar flag, nova oportunidade
                         }
                         if (discoveredHost == null) {
                             scanSubnet(netIface.name, addr)
                         }
                     } else {
                         if (wasTethering) {
-                            RemoteLog.i(TAG, "Ancoragem USB não detectada mais.")
+                            RemoteLog.i(TAG, "✗ Ancoragem USB desconectada")
                             wasTethering = false
                         }
-                        if (discoveredHost != null) {
+                        
+                        // BUG FIX USB: Se USB falhou e não tentamos ADB ainda, tentar
+                        if (discoveredHost == null && !adbReverseTried) {
+                            RemoteLog.i(TAG, "Sem interface USB — tentando ADB reverse como fallback...")
+                            if (adbReverseClient.setupReverse()) {
+                                discoveredHost = "127.0.0.1"  // localhost via ADB reverse
+                                RemoteLog.i(TAG, "✓ ADB reverse ativado: localhost:$SERVER_PORT")
+                                maybeNotify()
+                                adbReverseTried = true
+                            } else {
+                                RemoteLog.w(TAG, "ADB reverse não disponível ou falhou")
+                                adbReverseTried = true  // não tentar de novo neste ciclo
+                            }
+                        } else if (discoveredHost != null) {
                             discoveredHost = null
                             scanGeneration.incrementAndGet()
                             maybeNotify()
@@ -160,7 +199,8 @@ class UsbConnectionMonitor(private val context: Context) {
                     Socket().use { socket ->
                         // Rota diretamente conectada — o kernel escolhe a
                         // interface certa sozinho (ver nota na doc da classe).
-                        socket.connect(InetSocketAddress(candidate, SERVER_PORT), 200)
+                        // CORREÇÃO USB: timeout de 1000ms em vez de 200ms
+                        socket.connect(InetSocketAddress(candidate, SERVER_PORT), CONNECT_TIMEOUT_MS)
                         if (found.compareAndSet(false, true) && generation == scanGeneration.get()) {
                             discoveredHost = candidate
                             RemoteLog.i(TAG, "PC encontrado via cabo em $candidate:$SERVER_PORT")
@@ -201,5 +241,8 @@ class UsbConnectionMonitor(private val context: Context) {
         pollThread = null
         discoveredHost = null
         scanGeneration.incrementAndGet() // cancela qualquer varredura pendente
+        // BUG FIX USB: cleanup de ADB reverse
+        adbReverseClient.cleanup()
+        RemoteLog.i(TAG, "Monitor de Ancoragem USB parado")
     }
 }
