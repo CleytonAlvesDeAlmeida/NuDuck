@@ -1,5 +1,6 @@
 package com.droidmonitor.webrtc
 
+import com.droidmonitor.util.HostValidator
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -60,6 +61,15 @@ class SignalingClient(
     private val remoteLogSink: (JSONObject) -> Unit = { payload -> send(payload) }
 
     fun connect() {
+        // BUG FIX: validar host antes de conectar
+        if (!HostValidator.isValidHost(host)) {
+            RemoteLog.e(TAG, "Host inválido: '$host'")
+            listener?.onSignalingError("Host inválido: $host")
+            return
+        }
+        
+        RemoteLog.i(TAG, "Conectando a ws://$host:$port/ws")
+        
         val request = Request.Builder()
             .url("ws://$host:$port/ws")
             .build()
@@ -67,7 +77,7 @@ class SignalingClient(
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 RemoteLog.attach(remoteLogSink)
-                RemoteLog.i(TAG, "WebSocket conectado a $host:$port")
+                RemoteLog.i(TAG, "✓ WebSocket conectado a $host:$port")
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -75,7 +85,7 @@ class SignalingClient(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                RemoteLog.e(TAG, "Falha no WebSocket", t)
+                RemoteLog.e(TAG, "✗ Falha no WebSocket", t)
                 listener?.onSignalingError(t.message ?: "Erro de conexão")
                 RemoteLog.detach(remoteLogSink)
             }

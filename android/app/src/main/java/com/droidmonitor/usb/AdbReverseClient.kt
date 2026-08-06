@@ -68,58 +68,66 @@ class AdbReverseClient {
 
     /**
      * Configura o reverse tunneling: `adb reverse tcp:8765 tcp:8765`
-     * Redireciona conexões do PC na porta 8765 → celular localhost:8765
-     *
-     * Retorna true se conseguiu configurar e a conexão respondeu.
+     * Com retry 3x e teste imediato de conexão.
+     * Retorna true APENAS se a conexão foi testada e funcionou.
      */
     fun setupReverse(): Boolean {
         if (!isAdbAvailable()) {
-            RemoteLog.w(TAG, "ADB não disponível, pulando reverse tunneling")
+            RemoteLog.w(TAG, "✗ ADB não disponível — reverse tunneling impossível")
             return false
         }
 
         val adbPath = lastAdbPath ?: return false
+        
+        repeat(3) { attempt ->
+            try {
+                RemoteLog.i(TAG, "🔄 Tentativa ${attempt + 1}/3 de ADB reverse...")
+                
+                val process = Runtime.getRuntime().exec(
+                    arrayOf(adbPath, "reverse", "tcp:$ADB_FORWARD_PORT", "tcp:$ADB_LOCAL_PORT")
+                )
 
-        try {
-            RemoteLog.i(TAG, "Configurando ADB reverse: $adbPath reverse tcp:$ADB_FORWARD_PORT tcp:$ADB_LOCAL_PORT")
+                // Aguardar com timeout
+                val completed = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+                if (!completed) {
+                    process.destroyForcibly()
+                    RemoteLog.w(TAG, "⏱️ ADB reverse timeout (tentativa ${attempt + 1})")
+                    return@repeat
+                }
 
-            val process = Runtime.getRuntime().exec(
-                arrayOf(adbPath, "reverse", "tcp:$ADB_FORWARD_PORT", "tcp:$ADB_LOCAL_PORT")
-            )
+                val returnCode = process.exitValue()
+                if (returnCode != 0) {
+                    val error = process.errorStream.bufferedReader().readText()
+                    RemoteLog.w(TAG, "⚠️ ADB reverse falhou (código $returnCode): $error")
+                    return@repeat
+                }
 
-            // Aguardar com timeout
-            val completed = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
-            if (!completed) {
-                process.destroyForcibly()
-                RemoteLog.w(TAG, "ADB reverse timeout (>5s)")
-                return false
+                RemoteLog.i(TAG, "✓ ADB reverse setup OK")
+                
+                // Testar IMEDIATAMENTE (não confiar cegamente)
+                if (testConnection()) {
+                    isReversed = true
+                    RemoteLog.i(TAG, "✓✓ ADB reverse FUNCIONANDO (teste passou)")
+                    return true  // SUCESSO!
+                } else {
+                    RemoteLog.w(TAG, "❌ ADB reverse setup OK mas teste de conexão falhou")
+                    teardownReverse()  // cleanup se teste falhou
+                }
+            } catch (e: Exception) {
+                RemoteLog.w(TAG, "❌ Erro ADB reverse tentativa ${attempt + 1}: ${e.message}")
             }
-
-            val returnCode = process.exitValue()
-            if (returnCode != 0) {
-                // Ler stderr pra mais info
-                val error = process.errorStream.bufferedReader().readText()
-                RemoteLog.w(TAG, "ADB reverse falhou (código $returnCode): $error")
-                return false
+            
+            // Aguardar antes de retry (exceto na última)
+            if (attempt < 2) {
+                try {
+                    Thread.sleep(500)
+                } catch (_: InterruptedException) {
+                }
             }
-
-            isReversed = true
-            RemoteLog.i(TAG, "✓ ADB reverse configurado com sucesso")
-
-            // Testar a conexão imediatamente
-            if (testConnection()) {
-                RemoteLog.i(TAG, "✓ Conexão ADB reverse testada com sucesso")
-                return true
-            } else {
-                RemoteLog.w(TAG, "✗ Conexão ADB reverse falhou no teste")
-                teardownReverse()  // cleanup se teste falhou
-                return false
-            }
-
-        } catch (e: Exception) {
-            RemoteLog.w(TAG, "Exceção ao configurar ADB reverse: ${e.message}")
-            return false
         }
+        
+        RemoteLog.e(TAG, "✗ ADB reverse FALHOU após 3 tentativas")
+        return false
     }
 
     /**

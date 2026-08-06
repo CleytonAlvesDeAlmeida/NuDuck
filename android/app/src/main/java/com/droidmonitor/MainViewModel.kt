@@ -16,6 +16,7 @@ import com.droidmonitor.settings.SettingsRepository
 import com.droidmonitor.webrtc.RemoteLog
 import com.droidmonitor.webrtc.SignalingClient
 import com.droidmonitor.webrtc.WebRtcClient
+import com.droidmonitor.util.HostValidator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -194,12 +195,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun connectViaCable() {
         val app = getApplication<Application>()
         val host = usbMonitor.discoveredPcHost()
-        if (host == null) {
+        
+        // BUG FIX: validar host antes de tentar conectar
+        if (host == null || !HostValidator.isValidHost(host)) {
+            RemoteLog.e("MainViewModel", "Host inválido descoberto: '$host'")
             _uiState.update {
                 it.copy(screen = Screen.ConnectionError(app.getString(R.string.usb_pc_not_found)))
             }
             return
         }
+        
         val name = app.getString(R.string.pc_via_cable)
         selectPc(PcInfo(name = name, host = host, port = 8765))
     }

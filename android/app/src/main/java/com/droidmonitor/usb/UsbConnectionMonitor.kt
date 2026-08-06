@@ -1,6 +1,7 @@
 package com.droidmonitor.usb
 
 import android.content.Context
+import com.droidmonitor.util.HostValidator
 import com.droidmonitor.webrtc.RemoteLog
 import java.net.Inet4Address
 import java.net.InetSocketAddress
@@ -202,8 +203,15 @@ class UsbConnectionMonitor(private val context: Context) {
                         // CORREÇÃO USB: timeout de 1000ms em vez de 200ms
                         socket.connect(InetSocketAddress(candidate, SERVER_PORT), CONNECT_TIMEOUT_MS)
                         if (found.compareAndSet(false, true) && generation == scanGeneration.get()) {
+                            // BUG FIX: validar host antes de usar
+                            if (!HostValidator.isValidHost(candidate)) {
+                                RemoteLog.w(TAG, "⚠️ Host inválido encontrado: '$candidate'")
+                                found.set(false)
+                                return@execute
+                            }
+                            
                             discoveredHost = candidate
-                            RemoteLog.i(TAG, "PC encontrado via cabo em $candidate:$SERVER_PORT")
+                            RemoteLog.i(TAG, "✓ PC encontrado via cabo em $candidate:$SERVER_PORT")
                             maybeNotify()
                         }
                     }

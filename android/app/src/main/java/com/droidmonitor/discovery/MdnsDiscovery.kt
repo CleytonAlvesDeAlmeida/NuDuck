@@ -3,6 +3,7 @@ package com.droidmonitor.discovery
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.util.Log
+import com.droidmonitor.util.HostValidator
 import javax.jmdns.JmDNS
 import javax.jmdns.ServiceEvent
 import javax.jmdns.ServiceListener
@@ -38,7 +39,13 @@ class MdnsDiscovery(private val context: Context) {
             val info = event.info
             val addresses = info.inetAddresses
             if (addresses.isEmpty()) return
-            val host = addresses[0].hostAddress ?: return
+            var host = addresses[0].hostAddress
+            
+            // BUG FIX: validar host, descartar IPv6 link-local
+            if (host == null || host.isBlank()) return
+            if (host.contains("%")) return  // skip fe80::1%eth0
+            if (!HostValidator.isValidHost(host)) return
+            
             val pcName = info.getPropertyString("name") ?: info.name
             val pc = PcInfo(name = pcName, host = host, port = info.port)
             Log.i(TAG, "PC encontrado: $pc")
